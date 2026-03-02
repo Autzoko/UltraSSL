@@ -1,0 +1,56 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:23.10-py3
+
+%labels
+    Author Lang Tian
+    Project UltraSSL
+    Description DINOv2 domain-adaptive SSL pretraining for breast ultrasound
+
+%post
+    # System packages
+    apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Python dependencies (torch/torchvision already in base image)
+    pip install --no-cache-dir \
+        'omegaconf>=2.3.0' \
+        fvcore \
+        iopath \
+        'Pillow>=9.0.0'
+
+    # Create mount points for bind mounts at runtime
+    mkdir -p /opt/ultrassl /data /outputs
+
+%environment
+    # Disable xformers — use PyTorch SDPA fallback
+    export XFORMERS_DISABLED=1
+    # Project paths (code bind-mounted at runtime to /opt/ultrassl)
+    export ULTRASSL_ROOT=/opt/ultrassl
+    export PYTHONPATH=/opt/ultrassl:/opt/ultrassl/dinov2:$PYTHONPATH
+    # NCCL settings for multi-GPU
+    export NCCL_DEBUG=INFO
+    export NCCL_IB_DISABLE=0
+
+%runscript
+    cd /opt/ultrassl
+    exec python train_ultrassl.py "$@"
+
+%help
+    UltraSSL: DINOv2 domain-adaptive self-supervised pretraining for breast ultrasound.
+
+    This container provides the runtime environment (PyTorch + CUDA + dependencies).
+    Project code and data are bind-mounted at runtime:
+
+      --bind /path/to/source:/opt/ultrassl    (project code)
+      --bind /path/to/data:/data              (dataset)
+      --bind /path/to/outputs:/outputs        (checkpoints)
+
+    === Example ===
+    singularity exec --nv \
+        --bind /scratch/$USER/ultrassl/source:/opt/ultrassl \
+        --bind /scratch/$USER/data:/data \
+        --bind /scratch/$USER/ultrassl/outputs:/outputs \
+        ultrassl.sif \
+        python /opt/ultrassl/train_ultrassl.py \
+        --config /opt/ultrassl/config/ultrassl_vitb14.yaml

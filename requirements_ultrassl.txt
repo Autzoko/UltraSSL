@@ -1,0 +1,15 @@
+# UltraSSL dependencies
+# Core (should match your CUDA version)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Config
+omegaconf>=2.3.0
+
+# DINOv2 dependencies (subset — no xformers needed)
+fvcore
+iopath
+numpy
+
+# Image processing
+Pillow>=9.0.0

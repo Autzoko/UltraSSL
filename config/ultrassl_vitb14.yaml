@@ -1,0 +1,126 @@
+# UltraSSL: DINOv2 domain-adaptive pretraining for breast ultrasound
+# Default config for ViT-B/14 backbone
+#
+# Usage:
+#   python train_ultrassl.py --config config/ultrassl_vitb14.yaml
+#   torchrun --nproc_per_node=2 train_ultrassl.py --config config/ultrassl_vitb14.yaml
+#
+# Override any value via CLI:
+#   python train_ultrassl.py --config config/ultrassl_vitb14.yaml optim.epochs=20 train.batch_size_per_gpu=16
+
+# --- Model ---
+model:
+  arch: vit_base
+  patch_size: 14
+  pretrained: "dinov2_vitb14"       # torch hub model name, or local .pth path
+  drop_path_rate: 0.1               # lower than DINOv2's 0.3 for domain adaptation
+
+# --- DINO loss ---
+dino:
+  loss_weight: 1.0
+  head_n_prototypes: 65536
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  head_hidden_dim: 2048
+  koleo_loss_weight: 0.1
+
+# --- iBOT masked patch loss (key for dense features) ---
+ibot:
+  loss_weight: 1.0                  # keep strong for dense patch representations
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.5
+  separate_head: false
+  head_n_prototypes: 65536
+
+# --- Teacher EMA ---
+teacher:
+  momentum_teacher: 0.996           # higher than DINOv2's 0.992 for domain adaptation
+  final_momentum_teacher: 1.0
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 10
+
+# --- Optimizer ---
+optim:
+  epochs: 50                        # domain adaptation, not from-scratch
+  base_lr: 5.0e-5                   # fine-tuning regime (DINOv2 uses 4e-3 from scratch)
+  lr: 0.0                           # auto-computed from base_lr + batch size
+  min_lr: 1.0e-6
+  warmup_epochs: 5
+  weight_decay: 0.04
+  weight_decay_end: 0.2
+  clip_grad: 3.0
+  patch_embed_lr_mult: 0.1          # very low for pretrained patch embedding
+  layerwise_decay: 0.9
+  freeze_last_layer_epochs: 1
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+# --- Training ---
+train:
+  batch_size_per_gpu: 24            # fits ViT-B/14 + 6 local crops on single GPU
+  num_workers: 8
+  output_dir: ./outputs/ultrassl_vitb14
+  OFFICIAL_EPOCH_LENGTH: 1000       # adjust based on dataset size
+  seed: 42
+  centering: "centering"            # or "sinkhorn_knopp"
+
+# --- Multi-crop ---
+crops:
+  global_crops_scale:
+    - 0.4
+    - 1.0
+  local_crops_scale:
+    - 0.15
+    - 0.4                           # larger min than DINOv2's 0.05 to keep small lesions
+  local_crops_number: 6             # reduced from 8 for single-GPU memory
+  global_crops_size: 224
+  local_crops_size: 98              # 98 = 7*14, divisible by patch_size
+
+# --- Ultrasound augmentations ---
+augmentation:
+  # Intensity (grayscale-aware, no hue/saturation)
+  brightness_jitter: 0.3
+  contrast_jitter: 0.3
+  gaussian_noise_std:
+    - 0.01
+    - 0.05
+  gaussian_noise_p: 0.4
+  gamma_range:
+    - 0.7
+    - 1.5
+  gamma_p: 0.3
+  vertical_flip_p: 0.3
+  # Frequency-domain
+  freq_augment_p: 0.3               # P(applying any freq augmentation per view)
+  fda_beta:
+    - 0.01
+    - 0.15
+  spectral_band_magnitude: 0.3
+  spectral_dropout_ratio: 0.15
+
+# --- Data loading ---
+data:
+  data_root_json: config/data_root.json
+  volume_slice_stride: 3            # subsample every 3rd ABUS slice
+  min_slice_entropy: 0.0            # 0 = no filtering
+  image_extensions:
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".bmp"
+    - ".tif"
+    - ".npy"
+
+# --- Checkpointing ---
+checkpoint:
+  save_period_epochs: 5
+  max_to_keep: 3
+  eval_period_iterations: 5000
+
+# --- Diagnostics ---
+diagnostics:
+  embed_check_period: 500
+  num_probe_images: 32
