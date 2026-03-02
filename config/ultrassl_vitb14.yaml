@@ -102,8 +102,11 @@ augmentation:
   spectral_dropout_ratio: 0.15
 
 # --- Data loading ---
+# Set shard_dir to use WebDataset (tar shards), or leave empty for raw file loading.
+# Create shards: python -m ultrassl.data.create_shards --data-root config/data_root.json --output-dir shards/
 data:
   data_root_json: config/data_root.json
+  shard_dir: ""                     # e.g., "shards/" or "/scratch/$USER/shards"
   volume_slice_stride: 3            # subsample every 3rd ABUS slice
   min_slice_entropy: 0.0            # 0 = no filtering
   image_extensions:

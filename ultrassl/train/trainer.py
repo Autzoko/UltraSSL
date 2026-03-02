@@ -36,6 +36,13 @@ from ultrassl.data.augmentations import UltrasoundAugmentationDINO
 from ultrassl.models.ssl_meta_arch import UltraSSLMetaArch
 from ultrassl.utils.diagnostics import DiagnosticsLogger
 
+# WebDataset is optional — only needed when using shard-based loading
+try:
+    from ultrassl.data.wds_dataset import build_wds_dataset
+    HAS_WEBDATASET = True
+except ImportError:
+    HAS_WEBDATASET = False
+
 logger = logging.getLogger("ultrassl")
 
 
@@ -275,21 +282,6 @@ def train(cfg):
     )
 
     data_cfg = cfg.get("data", {})
-    data_root_json = data_cfg.get("data_root_json", "config/data_root.json")
-    # Resolve relative path
-    if not os.path.isabs(data_root_json):
-        data_root_json = os.path.join(str(_project_root), data_root_json)
-
-    dataset = UltrasoundDataset(
-        data_root_json=data_root_json,
-        transform=data_transform,
-        target_transform=lambda _: (),
-        volume_slice_stride=data_cfg.get("volume_slice_stride", 3),
-        min_slice_entropy=data_cfg.get("min_slice_entropy", 0.0),
-    )
-
-    if len(dataset) == 0:
-        logger.warning("Dataset is empty! Check data paths. Running in dry-run mode.")
 
     # Mask generator for iBOT
     img_size = cfg.crops.global_crops_size
@@ -312,21 +304,75 @@ def train(cfg):
         dtype=collate_dtype,
     )
 
-    if world_size > 1:
-        sampler = DistributedSampler(dataset, shuffle=True)
-    else:
-        sampler = RandomSampler(dataset)
+    # Choose data loading mode: WebDataset shards or raw image files
+    shard_dir = data_cfg.get("shard_dir", "")
+    use_webdataset = bool(shard_dir) and HAS_WEBDATASET
 
-    data_loader = DataLoader(
-        dataset,
-        batch_size=cfg.train.batch_size_per_gpu,
-        sampler=sampler,
-        num_workers=cfg.train.num_workers,
-        collate_fn=collate_fn,
-        drop_last=True,
-        pin_memory=device.type == "cuda",
-        persistent_workers=cfg.train.num_workers > 0,
-    )
+    if use_webdataset:
+        # --- WebDataset mode: read from .tar shards ---
+        if not os.path.isabs(shard_dir):
+            shard_dir = os.path.join(str(_project_root), shard_dir)
+        logger.info(f"Using WebDataset shards from: {shard_dir}")
+
+        wds_dataset, wds_loader = build_wds_dataset(
+            shard_dir=shard_dir,
+            transform=data_transform,
+            epoch_length=cfg.train.OFFICIAL_EPOCH_LENGTH,
+            batch_size=cfg.train.batch_size_per_gpu,
+            num_workers=cfg.train.num_workers,
+            world_size=world_size,
+            rank=rank,
+        )
+
+        # Wrap with collation — WebDataset yields individual samples,
+        # we batch + collate them the same way as the standard pipeline
+        data_loader = DataLoader(
+            wds_dataset,
+            batch_size=cfg.train.batch_size_per_gpu,
+            num_workers=cfg.train.num_workers,
+            collate_fn=collate_fn,
+            drop_last=True,
+            pin_memory=device.type == "cuda",
+            persistent_workers=cfg.train.num_workers > 0,
+        )
+        dataset_size_str = f"WebDataset shards in {shard_dir}"
+    else:
+        # --- Standard mode: read raw image files ---
+        if shard_dir and not HAS_WEBDATASET:
+            logger.warning("shard_dir is set but webdataset is not installed. "
+                           "Falling back to raw file loading. Install: pip install webdataset")
+
+        data_root_json = data_cfg.get("data_root_json", "config/data_root.json")
+        if not os.path.isabs(data_root_json):
+            data_root_json = os.path.join(str(_project_root), data_root_json)
+
+        dataset = UltrasoundDataset(
+            data_root_json=data_root_json,
+            transform=data_transform,
+            target_transform=lambda _: (),
+            volume_slice_stride=data_cfg.get("volume_slice_stride", 3),
+            min_slice_entropy=data_cfg.get("min_slice_entropy", 0.0),
+        )
+
+        if len(dataset) == 0:
+            logger.warning("Dataset is empty! Check data paths. Running in dry-run mode.")
+
+        if world_size > 1:
+            sampler = DistributedSampler(dataset, shuffle=True)
+        else:
+            sampler = RandomSampler(dataset)
+
+        data_loader = DataLoader(
+            dataset,
+            batch_size=cfg.train.batch_size_per_gpu,
+            sampler=sampler,
+            num_workers=cfg.train.num_workers,
+            collate_fn=collate_fn,
+            drop_last=True,
+            pin_memory=device.type == "cuda",
+            persistent_workers=cfg.train.num_workers > 0,
+        )
+        dataset_size_str = f"{len(dataset)} images"
 
     # ================================================================
     # RESUME
@@ -355,7 +401,7 @@ def train(cfg):
     iteration = start_iter
 
     logger.info(f"Starting training: {start_iter} -> {max_iter} iterations")
-    logger.info(f"  Dataset size: {len(dataset)}, Batch size: {cfg.train.batch_size_per_gpu}")
+    logger.info(f"  Dataset: {dataset_size_str}, Batch size: {cfg.train.batch_size_per_gpu}")
     logger.info(f"  Epoch length: {epoch_len}, Total epochs: {cfg.optim.epochs}")
     logger.info(f"  AMP: {'enabled' if use_amp else 'disabled (non-CUDA device)'}")
 

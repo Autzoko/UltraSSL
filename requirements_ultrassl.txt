@@ -13,3 +13,6 @@ numpy
 
 # Image processing
 Pillow>=9.0.0
+
+# WebDataset (for shard-based loading on HPC)
+webdataset>=0.2.86

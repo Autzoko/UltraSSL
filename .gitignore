@@ -11,8 +11,11 @@ outputs/
 *.sif
 
 # Data
+/data/
 *.npy
 *.npz
+*.tar
+shards/
 
 # OS
 .DS_Store
