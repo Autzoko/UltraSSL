@@ -84,12 +84,10 @@ def load_config(config_path, cli_opts=None):
 
     # Compute derived values
     if cfg.optim.get("lr", 0) == 0:
-        # Scale LR based on batch size (sqrt scaling relative to 1024)
-        effective_bs = cfg.train.batch_size_per_gpu
-        if dist.is_initialized():
-            effective_bs *= dist.get_world_size()
-        cfg.optim.lr = cfg.optim.base_lr * math.sqrt(effective_bs / 1024.0)
-        logger.info(f"Scaled LR: {cfg.optim.lr:.6f} (base={cfg.optim.base_lr}, bs={effective_bs})")
+        # Use base_lr directly — it's already tuned for domain adaptation / fine-tuning.
+        # Sqrt batch-size scaling is only appropriate for from-scratch training at bs=1024+.
+        cfg.optim.lr = cfg.optim.base_lr
+        logger.info(f"Using LR: {cfg.optim.lr:.6f} (base_lr, no batch-size scaling)")
 
     return cfg
 
