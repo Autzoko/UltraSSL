@@ -62,13 +62,33 @@ git clone --recurse-submodules https://github.com/Autzoko/UltraSSL.git
 cd UltraSSL
 ```
 
-### 2. Install dependencies
+### 2. Create conda environment
 
 ```bash
+# Create environment with Python 3.10 (3.9 also works)
+conda create -n ultrassl python=3.10 -y
+conda activate ultrassl
+
+# Install PyTorch (pick ONE line matching your hardware)
+# CUDA 11.8
+conda install pytorch torchvision pytorch-cuda=11.8 -c pytorch -c nvidia -y
+# CUDA 12.1
+conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia -y
+# CPU only (for data preprocessing / testing without GPU)
+conda install pytorch torchvision cpuonly -c pytorch -y
+
+# Install remaining dependencies
 pip install -r requirements_ultrassl.txt
 ```
 
-Core requirements: `torch>=2.0`, `torchvision>=0.15`, `omegaconf`, `fvcore`, `iopath`, `webdataset`. No xformers needed.
+The `requirements_ultrassl.txt` installs: `omegaconf`, `fvcore`, `iopath`, `webdataset`, `numpy`, `Pillow`. No xformers needed — the pipeline uses PyTorch's native SDPA attention.
+
+Verify the installation:
+
+```bash
+python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+python -c "from ultrassl.data.dataset import UltrasoundDataset; print('UltraSSL OK')"
+```
 
 ### 3. Prepare data
 
