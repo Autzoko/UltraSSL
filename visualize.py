@@ -71,6 +71,54 @@ def find_images(image_dir, extensions=(".png", ".jpg", ".jpeg", ".bmp", ".tif"),
     return paths
 
 
+def load_images_from_shards(shard_dir, num_images=8, img_size=224):
+    """Load images from WebDataset .tar shards.
+
+    Returns list of (name, original_pil, preprocessed_tensor) tuples.
+    """
+    import glob
+    import tarfile
+    import io
+
+    shard_files = sorted(glob.glob(os.path.join(shard_dir, "shard-*.tar")))
+    if not shard_files:
+        # Maybe the directory itself contains .tar files with other names
+        shard_files = sorted(glob.glob(os.path.join(shard_dir, "*.tar")))
+    if not shard_files:
+        return []
+
+    preprocess = transforms.Compose([
+        transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    results = []
+    for shard_path in shard_files:
+        if len(results) >= num_images:
+            break
+        try:
+            with tarfile.open(shard_path, "r") as tar:
+                png_members = [m for m in tar.getmembers() if m.name.endswith(".png")]
+                for member in png_members:
+                    if len(results) >= num_images:
+                        break
+                    f = tar.extractfile(member)
+                    if f is None:
+                        continue
+                    img = Image.open(io.BytesIO(f.read())).convert("RGB")
+                    original = img.resize((img_size, img_size), Image.BICUBIC)
+                    tensor = preprocess(img).unsqueeze(0)
+                    name = Path(member.name).stem
+                    results.append((name, original, tensor))
+        except Exception as e:
+            logger.warning(f"Error reading shard {shard_path}: {e}")
+            continue
+
+    logger.info(f"Loaded {len(results)} images from {len(shard_files)} shards")
+    return results
+
+
 # ── Attention extraction ───────────────────────────────────────────────
 
 class AttentionExtractor:
@@ -327,16 +375,26 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Collect image paths
+    # Collect images — either raw files or from WebDataset shards
     image_paths = []
+    shard_images = []  # list of (name, original_pil, tensor) from shards
+
     if args.images:
         image_paths.extend(args.images)
     if args.image_dir:
-        image_paths.extend(find_images(args.image_dir, max_images=args.num_images))
-    if not image_paths:
-        parser.error("Provide --images or --image-dir")
+        raw = find_images(args.image_dir, max_images=args.num_images)
+        if raw:
+            image_paths.extend(raw)
+        else:
+            # No raw images found — try loading as WebDataset shards
+            logger.info(f"No raw images in {args.image_dir}, trying as WebDataset shard directory...")
+            shard_images = load_images_from_shards(args.image_dir, args.num_images, args.img_size)
 
-    logger.info(f"Visualizing {len(image_paths)} images")
+    if not image_paths and not shard_images:
+        parser.error("Provide --images or --image-dir (with raw images or .tar shards)")
+
+    total = len(image_paths) + len(shard_images)
+    logger.info(f"Visualizing {total} images")
 
     # Load model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -356,21 +414,24 @@ def main():
     grid_size = (grid_h, grid_w)
     logger.info(f"Patch grid: {grid_h}x{grid_w} = {grid_h * grid_w} patches")
 
+    # Build unified list of (name, original_pil, tensor)
+    image_items = []
+    for img_path in image_paths:
+        original, tensor = load_image(img_path, args.img_size)
+        image_items.append((Path(img_path).stem, original, tensor))
+    image_items.extend(shard_images)
+
     # Process each image
     all_patch_tokens = []
     all_originals = []
 
-    for img_path in image_paths:
-        name = Path(img_path).stem
+    for name, original, tensor in image_items:
         logger.info(f"Processing: {name}")
-
-        original, tensor = load_image(img_path, args.img_size)
         tensor = tensor.to(device)
 
         with torch.no_grad():
             out = backbone(tensor, is_training=True)
 
-        cls_token = out["x_norm_clstoken"].cpu().numpy()    # (1, dim)
         patch_tokens = out["x_norm_patchtokens"].cpu().numpy()[0]  # (num_patches, dim)
 
         all_patch_tokens.append(patch_tokens)
