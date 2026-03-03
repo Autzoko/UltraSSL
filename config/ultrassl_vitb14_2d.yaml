@@ -1,0 +1,122 @@
+# UltraSSL: DINOv2 domain-adaptive pretraining — 2D ultrasound datasets
+# Tuned for ~4K images (BUSI + BUSBRA + BUS + BUS_UC + BUS-UCLM)
+#
+# Usage:
+#   python train_ultrassl.py --config config/ultrassl_vitb14_2d.yaml \
+#       data.shard_dir=shards/
+
+# --- Model ---
+model:
+  arch: vit_base
+  patch_size: 14
+  pretrained: "dinov2_vitb14"
+  drop_path_rate: 0.1
+
+# --- DINO loss ---
+dino:
+  loss_weight: 1.0
+  head_n_prototypes: 65536
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  head_hidden_dim: 2048
+  koleo_loss_weight: 0.1
+
+# --- iBOT masked patch loss ---
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.5
+  separate_head: false
+  head_n_prototypes: 65536
+
+# --- Teacher EMA ---
+teacher:
+  momentum_teacher: 0.998            # higher than 0.996 — slower teacher for small dataset
+  final_momentum_teacher: 1.0
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 5      # shorter warmup (epochs are shorter)
+
+# --- Optimizer ---
+optim:
+  epochs: 100                         # more epochs to compensate for small dataset
+  base_lr: 3.0e-5                     # slightly lower LR — less data, easier to overfit
+  lr: 0.0
+  min_lr: 1.0e-6
+  warmup_epochs: 5
+  weight_decay: 0.04
+  weight_decay_end: 0.4              # higher final WD for regularization
+  clip_grad: 3.0
+  patch_embed_lr_mult: 0.1
+  layerwise_decay: 0.9
+  freeze_last_layer_epochs: 1
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+# --- Training ---
+train:
+  batch_size_per_gpu: 24
+  num_workers: 8
+  output_dir: ./outputs/ultrassl_vitb14_2d
+  OFFICIAL_EPOCH_LENGTH: 180          # ceil(4312 / 24) — 1 epoch = 1 full pass
+  seed: 42
+  centering: "centering"
+
+# --- Multi-crop ---
+crops:
+  global_crops_scale:
+    - 0.4
+    - 1.0
+  local_crops_scale:
+    - 0.15
+    - 0.4
+  local_crops_number: 6
+  global_crops_size: 224
+  local_crops_size: 98
+
+# --- Ultrasound augmentations ---
+augmentation:
+  brightness_jitter: 0.3
+  contrast_jitter: 0.3
+  gaussian_noise_std:
+    - 0.01
+    - 0.05
+  gaussian_noise_p: 0.4
+  gamma_range:
+    - 0.7
+    - 1.5
+  gamma_p: 0.3
+  vertical_flip_p: 0.3
+  freq_augment_p: 0.3
+  fda_beta:
+    - 0.01
+    - 0.15
+  spectral_band_magnitude: 0.3
+  spectral_dropout_ratio: 0.15
+
+# --- Data loading ---
+data:
+  data_root_json: config/data_root_2d.json
+  shard_dir: ""
+  volume_slice_stride: 3
+  min_slice_entropy: 0.0
+  image_extensions:
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".bmp"
+    - ".tif"
+    - ".npy"
+
+# --- Checkpointing ---
+checkpoint:
+  save_period_epochs: 10              # save every 10 epochs (= 1800 iters)
+  max_to_keep: 5
+  eval_period_iterations: 5000
+
+# --- Diagnostics ---
+diagnostics:
+  embed_check_period: 200             # check more often (total is only 18K iters)
+  num_probe_images: 32

@@ -73,35 +73,70 @@ def _load_image_as_rgb(path: str) -> Image.Image:
     return img.convert("RGB")
 
 
+# Directory names to skip (contain labels/masks/overlays, not training images)
+_SKIP_DIRS = {"overlay", "label", "labels", "mask", "masks", "GT", "gt",
+              "seg", "segmentation", "annotation", "annotations"}
+
+# Filename patterns indicating mask/label files (case-insensitive check)
+_MASK_PATTERNS = ("_mask", "_seg", "_label", "_gt", "_contour", "_overlay")
+
+
+def _is_mask_file(fname: str) -> bool:
+    """Check if a filename looks like a mask/label file."""
+    stem = Path(fname).stem.lower()
+    return any(p in stem for p in _MASK_PATTERNS)
+
+
+def _has_subdir(root: str, name: str) -> bool:
+    """Check if root has any subdirectory matching name (recursive)."""
+    for dirpath, dirnames, _ in os.walk(root):
+        if name in dirnames:
+            return True
+    return False
+
+
 def _scan_directory(
     root: str,
     extensions: set,
-    subdir_filter: str = "img",
+    subdir_filter: str = "auto",
 ) -> List[str]:
     """Recursively find all image files under root.
+
+    Automatically handles both 3D volume layouts (patient/study/img/*.png)
+    and 2D dataset layouts (class/image.png or flat directory of images).
 
     Args:
         root: Root directory to scan.
         extensions: Allowed file extensions.
-        subdir_filter: If set, only include files whose parent directory name
-            matches this string. This filters out overlay/label directories
-            in typical ultrasound volume layouts (patient/study/img/*.png).
-            Set to "" to disable filtering.
+        subdir_filter: Directory name filter for 3D data. Options:
+            - "auto": use "img" filter if img/ subdirs exist, else scan all
+            - "img" or other string: only include from matching subdirs
+            - "": disable filtering, scan all directories
     """
     paths = []
     if not os.path.isdir(root):
         logger.warning(f"Dataset root does not exist: {root}")
         return paths
-    for dirpath, _, filenames in os.walk(root):
-        # Skip directories that don't match the filter (e.g., overlay/, label/)
-        if subdir_filter and os.path.basename(dirpath) != subdir_filter:
-            # Also accept the root itself and intermediate directories that
-            # aren't leaf directories containing images
+
+    # Auto-detect: if the tree has "img/" subdirectories, use that filter
+    # (3D volume layout); otherwise scan everything (2D dataset layout)
+    if subdir_filter == "auto":
+        subdir_filter = "img" if _has_subdir(root, "img") else ""
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirname = os.path.basename(dirpath)
+
+        # Skip known mask/label directories
+        if dirname.lower() in {d.lower() for d in _SKIP_DIRS}:
+            continue
+
+        # Apply subdir filter for 3D volume layouts
+        if subdir_filter and dirname != subdir_filter:
             if any(_is_image_file(f, extensions) for f in filenames[:3]):
-                # This directory has images but doesn't match the filter — skip
                 continue
+
         for fname in sorted(filenames):
-            if _is_image_file(fname, extensions):
+            if _is_image_file(fname, extensions) and not _is_mask_file(fname):
                 paths.append(os.path.join(dirpath, fname))
     return paths
 
@@ -201,14 +236,22 @@ class UltrasoundDataset(Dataset):
         return path  # Return original, will warn during scan
 
     def _looks_like_volume_data(self, paths: List[str]) -> bool:
-        """Auto-detect volume data: many images grouped in folders with >50 slices each."""
+        """Auto-detect 3D volume data vs 2D image collections.
+
+        3D volumes: many parent directories (one per patient), each with many
+        sequential slices (e.g., 300 directories × 200 slices).
+        2D datasets: few parent directories (categories), each with many
+        independent images (e.g., 3 directories × 260 images).
+        """
         if not paths:
             return False
         volumes = _detect_volume_slices(paths)
         if not volumes:
             return False
-        avg_slices = len(paths) / len(volumes)
-        return avg_slices > 20  # Volumes typically have hundreds of slices
+        n_groups = len(volumes)
+        avg_slices = len(paths) / n_groups
+        # Need BOTH: many groups (>=10 patient volumes) AND many slices per group
+        return n_groups >= 10 and avg_slices > 20
 
     def _scan_all(self):
         """Scan all dataset roots and build the image path list."""

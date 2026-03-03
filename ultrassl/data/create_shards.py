@@ -57,7 +57,11 @@ def _looks_like_volume_data(paths):
     volumes = _detect_volume_slices(paths)
     if not volumes:
         return False
-    return len(paths) / len(volumes) > 20
+    n_groups = len(volumes)
+    avg_slices = len(paths) / n_groups
+    # 3D volume data: many groups (patient volumes) AND many slices per group
+    # 2D datasets: few groups (categories) with many images — NOT volume data
+    return n_groups >= 10 and avg_slices > 20
 
 
 def load_image_bytes(path: str) -> bytes:

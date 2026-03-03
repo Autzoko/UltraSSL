@@ -1,0 +1,24 @@
+{
+    "data": [
+        {
+            "name": "BUSI",
+            "path": "/Volumes/Lang/Research/Data/2D Ultrasound/BUSI"
+        },
+        {
+            "name": "BUSBRA",
+            "path": "/Volumes/Lang/Research/Data/2D Ultrasound/BUSBRA/Images"
+        },
+        {
+            "name": "BUS",
+            "path": "/Volumes/Lang/Research/Data/2D Ultrasound/BUS/original"
+        },
+        {
+            "name": "BUS_UC",
+            "path": "/Volumes/Lang/Research/Data/2D Ultrasound/BUS_UC/All/images"
+        },
+        {
+            "name": "BUS-UCLM",
+            "path": "/Volumes/Lang/Research/Data/2D Ultrasound/BUS-UCLM/images"
+        }
+    ]
+}

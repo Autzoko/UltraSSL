@@ -1,6 +1,5 @@
 {
-    "data": 
-    [
+    "data": [
         {
             "name": "BIrads",
             "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/BIrads_all"
@@ -11,15 +10,35 @@
         },
         {
             "name": "Class3",
-            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processedClass3_all"
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/Class3_all"
         },
         {
             "name": "Class4",
-            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processedClass4_all"
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/Class4_all"
         },
         {
             "name": "ABUS",
-            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processedABUS_all"
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/ABUS_all"
+        },
+        {
+            "name": "BUSI",
+            "path": "/Volumes/Lang/Research/Data/2D Ultrasound/BUSI"
+        },
+        {
+            "name": "BUSBRA",
+            "path": "/Volumes/Lang/Research/Data/2D Ultrasound/BUSBRA/Images"
+        },
+        {
+            "name": "BUS",
+            "path": "/Volumes/Lang/Research/Data/2D Ultrasound/BUS/original"
+        },
+        {
+            "name": "BUS_UC",
+            "path": "/Volumes/Lang/Research/Data/2D Ultrasound/BUS_UC/All/images"
+        },
+        {
+            "name": "BUS-UCLM",
+            "path": "/Volumes/Lang/Research/Data/2D Ultrasound/BUS-UCLM/images"
         }
     ]
 }
