@@ -48,10 +48,14 @@ def build_wds_dataset(
         raise FileNotFoundError(f"No shard files found in {shard_dir}")
 
     n_shards = len(shards)
-    logger.info(f"WebDataset: {n_shards} shards from {shard_dir}")
 
-    # Use brace expansion pattern for webdataset
-    shard_list = os.path.join(shard_dir, "shard-{000000..%06d}.tar" % (n_shards - 1))
+    # Cap workers to shard count — WebDataset distributes shards across workers,
+    # so workers without shards raise "No samples found" errors
+    if num_workers > n_shards:
+        logger.info(f"WebDataset: reducing num_workers {num_workers} → {n_shards} (matching shard count)")
+        num_workers = n_shards
+
+    logger.info(f"WebDataset: {n_shards} shards from {shard_dir}")
 
     def decode_sample(sample):
         """Decode a webdataset sample to (PIL Image, target)."""
@@ -65,9 +69,10 @@ def build_wds_dataset(
         target = ()
         return img, target
 
-    # Build pipeline
+    # Build pipeline — pass shard list directly, not brace expansion
     dataset = (
-        wds.WebDataset(shards, shardshuffle=True, nodesplitter=wds.split_by_node)
+        wds.WebDataset(shards, shardshuffle=True, nodesplitter=wds.split_by_node,
+                        empty_check=False)
         .shuffle(shuffle_buffer)
         .decode("pil")
         .map(decode_sample)
