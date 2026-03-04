@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ultrassl-dino
 #SBATCH --partition=nvidia
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
 #SBATCH --time=90:00:00
