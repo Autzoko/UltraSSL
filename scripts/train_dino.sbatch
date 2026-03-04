@@ -10,6 +10,8 @@
 
 set -e
 
+mkdir -p logs
+
 # --- Paths ---
 PROJECT_DIR=/scratch/ll5582/Projects/UltraSSL
 CONFIG=${PROJECT_DIR}/config/ultrassl_vitb14_3d_labeled.yaml
@@ -20,7 +22,7 @@ conda activate /scratch/ll5582/envs/ultrassl
 export XFORMERS_DISABLED=1
 
 cd ${PROJECT_DIR}
-mkdir -p logs
+
 
 echo "=== Job ${SLURM_JOB_ID} started at $(date) ==="
 echo "Node: $(hostname), GPU: ${CUDA_VISIBLE_DEVICES}"
