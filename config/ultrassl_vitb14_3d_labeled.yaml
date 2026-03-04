@@ -106,7 +106,7 @@ augmentation:
 # --- Data loading ---
 data:
   data_root_json: config/data_label_root_3d.json
-  shard_dir: "wds/"
+  shard_dir: "/scratch/ll5582/Data/Ultrasound/Shards"
   mode: "ssl"                           # use labeled shards in SSL mode (ignore labels)
   balance_datasets: true                # replicate smaller datasets to match largest
   pos_enrichment: 10.0                  # ~1:1 Pos:Neg ratio (8.9% positive → keep ~10% negatives)
