@@ -3,6 +3,8 @@ Diagnostics and logging utilities for UltraSSL training.
 
 - Loss curve logging to JSON
 - Periodic embedding sanity checks (mean/std, cosine similarity, PCA variance)
+- NN retrieval diversity check (collapse detection)
+- Patch token diversity check (within-image representation diversity)
 """
 
 import json
@@ -148,6 +150,14 @@ class DiagnosticsLogger:
             except Exception:
                 pass  # SVD can fail with bad numerics early in training
 
+        # NN retrieval diversity check
+        nn_record = self._check_nn_retrieval(cls_tokens)
+        record.update(nn_record)
+
+        # Patch diversity check
+        patch_div_record = self._check_patch_diversity(patch_tokens)
+        record.update(patch_div_record)
+
         with open(self.embed_log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
 
@@ -156,5 +166,77 @@ class DiagnosticsLogger:
             f"cls_std={record.get('cls_std', 0):.4f}, "
             f"patch_std={record.get('patch_std', 0):.4f}, "
             f"cos_sim={record.get('cls_cos_sim_mean', 0):.4f}, "
-            f"pca_top1={record.get('pca_top1_var_ratio', 0):.4f}"
+            f"pca_top1={record.get('pca_top1_var_ratio', 0):.4f}, "
+            f"nn_sim={record.get('nn_avg_sim', 0):.4f}, "
+            f"patch_div={record.get('patch_intra_sim_mean', 0):.4f}"
         )
+
+        # Alert on potential collapse
+        if record.get("cls_cos_sim_mean", 0) > 0.95:
+            logger.warning(f"[COLLAPSE WARNING iter {iteration}] "
+                           f"CLS cosine similarity very high ({record['cls_cos_sim_mean']:.4f}). "
+                           f"Features may be collapsing.")
+        if record.get("patch_intra_sim_mean", 0) > 0.90:
+            logger.warning(f"[COLLAPSE WARNING iter {iteration}] "
+                           f"Patch intra-image similarity very high ({record['patch_intra_sim_mean']:.4f}). "
+                           f"Patch tokens may be collapsing to uniform representation.")
+
+    def _check_nn_retrieval(self, cls_tokens):
+        """Check nearest-neighbor retrieval diversity from CLS tokens.
+
+        For each probe image, find its top-5 nearest neighbors by cosine similarity.
+        High avg similarity with low uniqueness indicates collapse.
+
+        Returns dict of metrics to merge into the embedding record.
+        """
+        record = {}
+        n = cls_tokens.shape[0]
+        if n < 3:
+            return record
+
+        cls_normed = F.normalize(cls_tokens, dim=-1)
+        cos_sim = torch.mm(cls_normed, cls_normed.t())
+
+        # Zero out diagonal (self-similarity)
+        cos_sim.fill_diagonal_(0.0)
+
+        k = min(5, n - 1)
+        topk_vals, topk_idx = cos_sim.topk(k, dim=1)
+
+        # Average NN similarity (high = collapse)
+        record["nn_avg_sim"] = topk_vals.mean().item()
+        record["nn_min_sim"] = topk_vals.min().item()
+        record["nn_max_sim"] = topk_vals.max().item()
+
+        # Fraction of unique NNs (low = collapse, all pointing to same neighbor)
+        unique_nns = len(set(topk_idx.flatten().tolist()))
+        record["nn_unique_fraction"] = unique_nns / max(1, n * k)
+
+        return record
+
+    def _check_patch_diversity(self, patch_tokens):
+        """Check within-image patch token diversity.
+
+        For each probe image, compute pairwise cosine similarity of its patch tokens.
+        High intra-image similarity means all patches produce the same representation.
+
+        Returns dict of metrics to merge into the embedding record.
+        """
+        record = {}
+        n_images = patch_tokens.shape[0]
+        if n_images == 0:
+            return record
+
+        intra_sims = []
+        for i in range(min(n_images, 8)):  # Cap to avoid slow computation
+            patches = patch_tokens[i]  # (num_patches, D)
+            patches_normed = F.normalize(patches, dim=-1)
+            sim = torch.mm(patches_normed, patches_normed.t())
+            # Off-diagonal mean
+            mask = ~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+            intra_sims.append(sim[mask].mean().item())
+
+        record["patch_intra_sim_mean"] = float(np.mean(intra_sims))
+        record["patch_intra_sim_std"] = float(np.std(intra_sims))
+
+        return record

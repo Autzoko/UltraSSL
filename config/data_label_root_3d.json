@@ -1,0 +1,20 @@
+{
+    "data": [
+        {
+            "name": "BIrads",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed_birads"
+        },
+        {
+            "name": "Class3",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed_class3"
+        },
+        {
+            "name": "Class4",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed_class4"
+        },
+        {
+            "name": "ABUS",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed_abus"
+        }
+    ]
+}

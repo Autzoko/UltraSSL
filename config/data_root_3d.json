@@ -1,0 +1,24 @@
+{
+    "data": [
+        {
+            "name": "BIrads",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/BIrads_all"
+        },
+        {
+            "name": "Duying",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/Duying_all"
+        },
+        {
+            "name": "Class3",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/Class3_all"
+        },
+        {
+            "name": "Class4",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/Class4_all"
+        },
+        {
+            "name": "ABUS",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/ABUS_all"
+        }
+    ]
+}

@@ -1,0 +1,56 @@
+# Patch-level lesion classifier — trained on frozen DINO features
+#
+# Usage:
+#   python train_lesion_classifier.py --config config/lesion_classifier.yaml
+#
+# Override any value via CLI:
+#   python train_lesion_classifier.py --config config/lesion_classifier.yaml \
+#       optim.epochs=50 classifier.mil_type=attention
+
+# --- Backbone (frozen) ---
+backbone:
+  checkpoint: "outputs/ultrassl_vitb14_3d_labeled/teacher_backbone_latest.pth"
+  arch: vit_base
+  patch_size: 14
+  img_size: 224
+
+# --- Classifier head ---
+classifier:
+  head_type: "mlp"              # "linear" or "mlp"
+  mlp_hidden_dim: 256
+  mil_type: "topk"              # "topk" or "attention"
+  topk_ratio: 0.1               # top 10% of patches (~26 out of 256)
+
+# --- Optimizer (only head params) ---
+optim:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 30
+  warmup_epochs: 3
+
+# --- Data ---
+data:
+  shard_dir: "wds/"
+  datasets: null                 # null = all datasets
+  batch_size: 32
+  num_workers: 8
+  oversample_positive: 3.0       # 3x oversampling of positive slices
+  shuffle_buffer: 5000
+
+# --- Loss ---
+loss:
+  patch_loss_weight: 1.0
+  image_loss_weight: 0.5
+  pos_weight: 10.0               # ~1/(positive_rate) ≈ 1/0.089 ≈ 11.2, use 10.0
+  ignore_margin: 3.5             # 0.25 * patch_size = half-patch border margin
+
+# --- Training ---
+train:
+  output_dir: ./outputs/lesion_classifier
+  seed: 42
+  log_every: 50
+
+# --- Evaluation ---
+eval:
+  val_split: 0.15                # hold out 15% of volumes
+  split_by: "volume"             # split by sample_id to prevent leakage

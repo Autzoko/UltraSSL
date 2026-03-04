@@ -39,6 +39,7 @@ from ultrassl.utils.diagnostics import DiagnosticsLogger
 # WebDataset is optional — only needed when using shard-based loading
 try:
     from ultrassl.data.wds_dataset import build_wds_dataset
+    from ultrassl.data.wds_labeled_dataset import build_labeled_wds_dataset
     HAS_WEBDATASET = True
 except ImportError:
     HAS_WEBDATASET = False
@@ -312,15 +313,33 @@ def train(cfg):
             shard_dir = os.path.join(str(_project_root), shard_dir)
         logger.info(f"Using WebDataset shards from: {shard_dir}")
 
-        wds_dataset, wds_loader = build_wds_dataset(
-            shard_dir=shard_dir,
-            transform=data_transform,
-            epoch_length=cfg.train.OFFICIAL_EPOCH_LENGTH,
-            batch_size=cfg.train.batch_size_per_gpu,
-            num_workers=cfg.train.num_workers,
-            world_size=world_size,
-            rank=rank,
-        )
+        data_mode = data_cfg.get("mode", "unlabeled")
+        if data_mode == "ssl":
+            # Labeled shards in SSL mode (ignore annotations, use all slices)
+            logger.info("Using labeled shards in SSL mode (ignoring annotations)")
+            wds_dataset, wds_loader = build_labeled_wds_dataset(
+                shard_dir=shard_dir,
+                mode="ssl",
+                transform=data_transform,
+                epoch_length=cfg.train.OFFICIAL_EPOCH_LENGTH,
+                batch_size=cfg.train.batch_size_per_gpu,
+                num_workers=cfg.train.num_workers,
+                world_size=world_size,
+                rank=rank,
+                balance_datasets=data_cfg.get("balance_datasets", True),
+                pos_enrichment=data_cfg.get("pos_enrichment", 0.0),
+            )
+        else:
+            # Standard unlabeled shards
+            wds_dataset, wds_loader = build_wds_dataset(
+                shard_dir=shard_dir,
+                transform=data_transform,
+                epoch_length=cfg.train.OFFICIAL_EPOCH_LENGTH,
+                batch_size=cfg.train.batch_size_per_gpu,
+                num_workers=cfg.train.num_workers,
+                world_size=world_size,
+                rank=rank,
+            )
 
         # Wrap with collation — WebDataset yields individual samples,
         # we batch + collate them the same way as the standard pipeline
