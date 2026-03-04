@@ -16,7 +16,7 @@ CONFIG=${PROJECT_DIR}/config/ultrassl_vitb14_3d_labeled.yaml
 
 # --- Environment ---
 source ~/.bashrc
-conda activate ultrassl
+conda activate ../../envs/ultrassl
 export XFORMERS_DISABLED=1
 
 cd ${PROJECT_DIR}
