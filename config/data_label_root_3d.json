@@ -2,19 +2,27 @@
     "data": [
         {
             "name": "BIrads",
-            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed_birads"
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/BIrads"
+        },
+        {
+            "name": "Class2",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/Class2"
         },
         {
             "name": "Class3",
-            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed_class3"
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/Class3"
         },
         {
             "name": "Class4",
-            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed_class4"
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/Class4"
         },
         {
-            "name": "ABUS",
-            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed_abus"
+            "name": "Abus",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/Abus"
+        },
+        {
+            "name": "Duying",
+            "path": "/Volumes/Lang/Research/Data/3D Ultrasound/processed/Duying"
         }
     ]
 }

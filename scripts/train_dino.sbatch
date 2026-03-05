@@ -3,15 +3,34 @@
 #SBATCH --output=logs/dino_%j.out
 #SBATCH --error=logs/dino_%j.err
 #SBATCH --partition=nvidia
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=96G
-#SBATCH --time=90:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=4
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=256G
+#SBATCH --time=72:00:00
+
+# =============================================================================
+# UltraSSL: DINOv2 domain-adaptive pretraining on breast ultrasound
+#
+# Multi-GPU training using torchrun (DistributedDataParallel).
+# Reads from WebDataset shards created by create_labeled_shards.py.
+#
+# Prerequisites:
+#   1. Create shards: python -m ultrassl.data.create_labeled_shards \
+#          --config config/data_label_root_3d.json \
+#          --output-dir /scratch/ll5582/Data/Ultrasound/Shards \
+#          --skip-boundary 3 --min-variance 100 --neg-stride 1
+#   2. DINOv2 ViT-B/14 checkpoint (auto-downloaded from torch hub on first run)
+#
+# Adjust --gres=gpu:N and --ntasks-per-node=N together for different GPU counts.
+# =============================================================================
 
 # Print job information
 echo "Job ID: $SLURM_JOB_ID"
 echo "Job Name: $SLURM_JOB_NAME"
 echo "Node: $SLURM_NODELIST"
+echo "GPUs: $SLURM_NTASKS_PER_NODE"
 echo "Start Time: $(date)"
 echo "Working Directory: $(pwd)"
 echo ""
@@ -36,26 +55,39 @@ export XFORMERS_DISABLED=1
 # Change to project directory
 PROJECT_DIR=/scratch/ll5582/Projects/UltraSSL
 CONFIG=${PROJECT_DIR}/config/ultrassl_vitb14_3d_labeled.yaml
+SHARD_DIR=/scratch/ll5582/Data/Ultrasound/Shards
 
 cd ${PROJECT_DIR}
 echo "Changed to directory: $(pwd)"
 echo ""
 
-# Create logs directory
-mkdir -p logs
+# Create directories
+mkdir -p logs outputs
 
-echo "Starting UltraSSL DINOv2 training"
+# Number of GPUs
+NGPUS=${SLURM_NTASKS_PER_NODE:-4}
+
+echo "=== UltraSSL DINOv2 Training ==="
 echo "Config: ${CONFIG}"
+echo "Shard dir: ${SHARD_DIR}"
+echo "GPUs: ${NGPUS}"
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo ""
 
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-python train_ultrassl.py --config ${CONFIG}
+# Launch multi-GPU training via torchrun
+torchrun \
+    --standalone \
+    --nproc_per_node=${NGPUS} \
+    train_ultrassl.py \
+    --config ${CONFIG} \
+    data.shard_dir=${SHARD_DIR}
 
 if [ $? -eq 0 ]; then
     echo ""
     echo "Training completed successfully!"
+    echo "Checkpoints saved to: outputs/ultrassl_vitb14_3d_labeled/"
 else
     echo ""
     echo "Training failed with exit code $?"

@@ -1,23 +1,28 @@
 # UltraSSL: DINOv2 domain-adaptive pretraining — 3D labeled ultrasound datasets
 # Uses all slices as unlabeled data for SSL (labels ignored during training).
-# Tuned for ~238K slices across 4 datasets (BIrads, Class3, Class4, ABUS).
+# 6 datasets: BIrads, Class2, Class3, Class4, Abus, Duying (~631K slices total).
 #
-# Usage:
-#   # 1. Create labeled shards (with quality filtering):
+# Multi-GPU training with torchrun (4-8 GPUs recommended):
+#
+#   # 1. Create labeled shards (run locally or on HPC):
 #   python -m ultrassl.data.create_labeled_shards \
 #       --config config/data_label_root_3d.json --output-dir wds/ \
 #       --skip-boundary 3 --min-variance 100 --neg-stride 1
 #
-#   # 2. Train DINOv2:
+#   # 2. Train DINOv2 (multi-GPU):
+#   torchrun --nproc_per_node=4 train_ultrassl.py \
+#       --config config/ultrassl_vitb14_3d_labeled.yaml \
+#       data.shard_dir=/path/to/shards
+#
+#   # Single GPU (debug):
 #   python train_ultrassl.py --config config/ultrassl_vitb14_3d_labeled.yaml
-#   torchrun --nproc_per_node=2 train_ultrassl.py --config config/ultrassl_vitb14_3d_labeled.yaml
 
 # --- Model ---
 model:
   arch: vit_base
   patch_size: 14
-  pretrained: "dinov2_vitb14"
-  drop_path_rate: 0.1
+  pretrained: "dinov2_vitb14"       # DINOv2 pretrained on ImageNet (domain adaptation)
+  drop_path_rate: 0.1               # lower than 0.3 for domain adaptation
 
 # --- DINO loss ---
 dino:
@@ -40,7 +45,7 @@ ibot:
 
 # --- Teacher EMA ---
 teacher:
-  momentum_teacher: 0.996
+  momentum_teacher: 0.996           # higher than DINOv2's 0.992 for domain adaptation
   final_momentum_teacher: 1.0
   warmup_teacher_temp: 0.04
   teacher_temp: 0.07
@@ -48,43 +53,47 @@ teacher:
 
 # --- Optimizer ---
 optim:
-  epochs: 50
-  base_lr: 5.0e-5
-  lr: 0.0
+  epochs: 50                        # domain adaptation, not from-scratch
+  base_lr: 5.0e-5                   # fine-tuning regime (DINOv2 uses 4e-3 from scratch)
+  lr: 0.0                           # auto-computed from base_lr
   min_lr: 1.0e-6
   warmup_epochs: 5
   weight_decay: 0.04
   weight_decay_end: 0.3
   clip_grad: 3.0
-  patch_embed_lr_mult: 0.1
-  layerwise_decay: 0.9
+  patch_embed_lr_mult: 0.1          # preserve pretrained patch embedding
+  layerwise_decay: 0.9              # deeper layers get lower LR
   freeze_last_layer_epochs: 1
   adamw_beta1: 0.9
   adamw_beta2: 0.999
 
 # --- Training ---
 train:
-  batch_size_per_gpu: 24
+  batch_size_per_gpu: 24            # 4 GPUs × 24 = 96 effective batch
   num_workers: 8
   output_dir: ./outputs/ultrassl_vitb14_3d_labeled
-  OFFICIAL_EPOCH_LENGTH: 5000           # ~120K effective samples / 24 per batch
+  OFFICIAL_EPOCH_LENGTH: 5000       # ~600K slices / (24*4 GPUs) ≈ 6250, round down
   seed: 42
   centering: "centering"
 
-# --- Multi-crop (adapted for ultrasound) ---
+# --- Multi-crop ---
+# 2 global crops (224×224) + 2 local crops (98×98)
+# Note: local_crops_size=98 (7×14) ensures exact patch grid, close to 96×96.
+# Local scale [0.25, 0.6] is larger than default to preserve small lesions.
 crops:
   global_crops_scale:
     - 0.4
     - 1.0
   local_crops_scale:
-    - 0.25                              # was 0.15 — larger min to keep small lesions
-    - 0.6                               # was 0.4 — larger max for ultrasound
-  local_crops_number: 3                 # was 6 — fewer local crops, saves memory
+    - 0.25                           # larger min — lesions can be very small
+    - 0.6                            # larger max — capture more context
+  local_crops_number: 2              # 2 local crops (user spec), saves memory for multi-GPU
   global_crops_size: 224
-  local_crops_size: 98
+  local_crops_size: 98               # 98 = 7×14, divisible by patch_size
 
 # --- Ultrasound augmentations ---
 augmentation:
+  # Intensity (grayscale-aware: no hue/saturation jitter, no solarize)
   brightness_jitter: 0.3
   contrast_jitter: 0.3
   gaussian_noise_std:
@@ -96,7 +105,8 @@ augmentation:
     - 1.5
   gamma_p: 0.3
   vertical_flip_p: 0.3
-  freq_augment_p: 0.15                  # was 0.3 — reduce to preserve ultrasound texture
+  # Frequency-domain augmentations (FDA, spectral band, spectral dropout)
+  freq_augment_p: 0.15              # conservative for ultrasound texture preservation
   fda_beta:
     - 0.01
     - 0.15
@@ -106,11 +116,11 @@ augmentation:
 # --- Data loading ---
 data:
   data_root_json: config/data_label_root_3d.json
-  shard_dir: "/scratch/ll5582/Data/Ultrasound/Shards"
-  mode: "ssl"                           # use labeled shards in SSL mode (ignore labels)
-  balance_datasets: true                # replicate smaller datasets to match largest
-  pos_enrichment: 10.0                  # ~1:1 Pos:Neg ratio (8.9% positive → keep ~10% negatives)
-  volume_slice_stride: 1
+  shard_dir: "/scratch/ll5582/Data/Ultrasound/Shards"    # HPC shard path
+  mode: "ssl"                        # labeled shards, SSL mode (ignore annotations)
+  balance_datasets: true             # replicate smaller datasets for equal sampling
+  pos_enrichment: 0.0                # 0 = use ALL slices (no negative subsampling for SSL)
+  volume_slice_stride: 1             # shards already subsampled during creation
   min_slice_entropy: 0.0
   image_extensions:
     - ".png"

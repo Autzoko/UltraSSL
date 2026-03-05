@@ -16,7 +16,7 @@ UltraSSL continues self-supervised training from official DINOv2 pretrained weig
 │  │ Stage 1: Data Preprocessing                                  │   │
 │  │                                                              │   │
 │  │  3D Ultrasound Volumes                                       │   │
-│  │  (BIrads, Class3, Class4, ABUS)                              │   │
+│  │  (BIrads, Class2, Class3, Class4, Abus, Duying)               │   │
 │  │         │                                                    │   │
 │  │         ▼                                                    │   │
 │  │  External preprocessing script                               │   │
@@ -40,7 +40,7 @@ UltraSSL continues self-supervised training from official DINOv2 pretrained weig
 │  │  Dataset-balanced + pos-enriched sampling                    │   │
 │  │         │                                                    │   │
 │  │         ▼                                                    │   │
-│  │  Multi-crop augmentation (2 global + 3 local crops)          │   │
+│  │  Multi-crop augmentation (2 global + 2 local crops)          │   │
 │  │  + frequency-domain augmentations (FDA, spectral)            │   │
 │  │         │                                                    │   │
 │  │         ▼                                                    │   │
@@ -87,37 +87,44 @@ UltraSSL continues self-supervised training from official DINOv2 pretrained weig
 
 ### Source datasets
 
-UltraSSL trains on 4 breast ultrasound datasets totaling **679 volumes / ~238K coronal 2D slices**:
+UltraSSL trains on 6 breast ultrasound datasets totaling **1,756 volumes / ~632K coronal 2D slices**:
 
-| Dataset | Volumes | Slices | Positive | Rate | Resolution | Orientation |
-|---------|---------|--------|----------|------|------------|-------------|
-| BIrads  | 57      | 22,300 | 3,218    | 14.4%| ~500×1017  | Landscape   |
-| Class3  | 207     | 72,468 | 5,523    | 7.6% | ~500×1015-1273 | Landscape |
-| Class4  | 215     | 75,308 | 6,118    | 8.1% | ~500×1015-1273 | Landscape |
-| ABUS    | 200     | 68,368 | 6,292    | 9.2% | ~865×546-682   | Portrait  |
+| Dataset | Volumes | Slices | Positive | Rate | Resolution | Notes |
+|---------|---------|--------|----------|------|------------|-------|
+| BIrads  | 57      | 22,300 | 3,218    | 14.4%| 1017×500   | BI-RADS classified |
+| Class2  | 147     | 51,450 | 4,634    | 9.0% | 1017×500   | |
+| Class3  | 207     | 72,450 | 4,611    | 6.4% | 1017×500   | |
+| Class4  | 216     | 75,250 | 6,718    | 8.9% | 1017×500   | |
+| Abus    | 200     | 68,444 | 6,656    | 9.7% | 682×865    | 3D ABUS volumes |
+| Duying  | 929     | 341,830| 0        | 0.0% | 1017×500   | Negative controls |
 
-Overall: **8.9% positive** (21,151 slices with lesions).
-
-Bbox sizes by image area: small <2% (58.7%), medium 2-5% (25.6%), large >=5% (15.8%). Most lesions are small relative to the image.
+Overall: **4.0% positive** (25,837 slices with lesions). Duying provides a large negative control set (54% of all slices).
 
 ### Data format
 
 Each dataset is preprocessed externally into paired `images/` and `labels/` directories:
 
 ```
-processed_<dataset>/
-├── images/
-│   ├── <volume_id>/
-│   │   ├── slice_0000.png    # Grayscale coronal slice, variable resolution
-│   │   ├── slice_0001.png
+processed/
+├── BIrads/
+│   ├── images/
+│   │   ├── <volume_id>/
+│   │   │   ├── slice_0000.png    # Grayscale coronal slice
+│   │   │   ├── slice_0001.png
+│   │   │   └── ...
 │   │   └── ...
-│   └── ...
-└── labels/
-    ├── <volume_id>/
-    │   ├── slice_0000.txt    # One line per bbox: has_lesion x1 y1 x2 y2
-    │   ├── slice_0001.txt    # Negative: "0 0 0 0 0"
-    │   └── ...               # Multiple lines = multiple bboxes per slice
-    └── ...
+│   ├── labels/
+│   │   ├── <volume_id>/
+│   │   │   ├── slice_0000.txt    # One line per bbox: has_lesion x1 y1 x2 y2
+│   │   │   ├── slice_0001.txt    # Negative: "0 0 0 0 0"
+│   │   │   └── ...
+│   │   └── ...
+│   └── summary.csv
+├── Class2/
+├── Class3/
+├── Class4/
+├── Abus/
+└── Duying/
 ```
 
 ### Data preprocessing (shard creation)
@@ -196,7 +203,7 @@ Input image
     │
     ├──▶ Multi-crop augmentation
     │       ├── 2 global crops (224×224, scale [0.4, 1.0])
-    │       └── 3 local crops  (98×98,   scale [0.25, 0.6])
+    │       └── 2 local crops  (98×98,   scale [0.25, 0.6])
     │
     ├──▶ Student (ViT-B/14 + DINOHead)
     │       • Processes all crops (global + local)
@@ -241,15 +248,26 @@ Three loss functions are computed jointly each iteration:
 | Teacher temperature | 0.04 → 0.07 (10-epoch warmup) | Sharpens teacher output gradually |
 | Epochs | 50 | |
 | Batch size | 24 per GPU | |
-| Epoch length | 5000 iterations | ~120K effective samples per epoch after pos enrichment |
+| Epoch length | 5000 iterations | ~600K slices / (24 × 4 GPUs) ≈ 6250, rounded |
+
+### Multi-GPU training
+
+UltraSSL uses PyTorch DistributedDataParallel (DDP) via `torchrun`. Each GPU gets a unique subset of WebDataset shards (via `wds.split_by_node`) and its own batch. Gradients are synchronized across GPUs automatically.
+
+```bash
+# 4 GPUs
+torchrun --standalone --nproc_per_node=4 train_ultrassl.py \
+    --config config/ultrassl_vitb14_3d_labeled.yaml
+
+# SLURM
+sbatch scripts/train_dino.sbatch
+```
 
 ### Data sampling strategy
 
-With 238K slices at 8.9% positive, naive uniform sampling would present overwhelming negatives. UltraSSL addresses this at two levels:
+With 632K slices across 6 datasets of varying sizes (BIrads: 22K vs Duying: 342K), UltraSSL uses dataset-balanced shard replication: smaller datasets' shard lists are replicated to match the largest dataset's shard count, ensuring approximately equal sampling across all datasets.
 
-1. **Dataset-balanced shard replication**: smaller datasets' shards are replicated to match the largest dataset's shard count. This ensures ~25% representation per dataset despite varying sizes (BIrads: 22K vs Class4: 75K).
-
-2. **Positive enrichment** (`pos_enrichment: 10.0`): during WebDataset streaming, negative samples are kept with probability `1/(1 + pos_enrichment)` ≈ 9%. All positive samples are kept. This achieves an approximate 1:1 Pos:Neg ratio in the training stream, ensuring the model sees lesion-containing slices frequently during SSL.
+For SSL pretraining, all slices (positive and negative) are used as unlabeled data (`pos_enrichment: 0.0`). Labels are ignored — the model learns representations from all ultrasound image structure.
 
 ### Augmentation pipeline
 
@@ -378,9 +396,10 @@ Split is by volume (not by slice) to prevent data leakage from adjacent slices o
 UltraSSL/
 ├── config/
 │   ├── data_root.json                # 2D dataset path definitions
-│   ├── data_label_root_3d.json       # 3D labeled dataset paths (BIrads, Class3, Class4, ABUS)
+│   ├── data_label_root_3d.json       # 3D labeled dataset paths (local Mac)
+│   ├── data_label_root_3d_hpc.json  # 3D labeled dataset paths (HPC /scratch)
 │   ├── ultrassl_vitb14.yaml          # SSL config for 2D datasets
-│   ├── ultrassl_vitb14_3d_labeled.yaml  # SSL config for 238K 3D slices
+│   ├── ultrassl_vitb14_3d_labeled.yaml  # SSL config for 632K 3D slices (multi-GPU)
 │   └── lesion_classifier.yaml        # Downstream classifier config
 ├── dinov2/                           # Official DINOv2 repo (git submodule, unmodified)
 ├── ultrassl/
@@ -400,6 +419,9 @@ UltraSSL/
 │   │   └── trainer.py                # Training loop (single-GPU / DDP)
 │   └── utils/
 │       └── diagnostics.py            # Loss logging + embedding/collapse diagnostics
+├── scripts/
+│   ├── train_dino.sbatch             # SLURM: multi-GPU DINOv2 training
+│   └── create_shards.sbatch          # SLURM: shard creation (no GPU)
 ├── train_ultrassl.py                 # SSL training entry point
 ├── train_lesion_classifier.py        # Downstream classifier entry point
 ├── visualize.py                      # Attention maps, PCA, similarity visualization
@@ -448,15 +470,17 @@ python -c "from ultrassl.data.dataset import UltrasoundDataset; print('UltraSSL 
 
 ### Step 1: Configure dataset paths
 
-Edit `config/data_label_root_3d.json`:
+Edit `config/data_label_root_3d.json` (local) or `config/data_label_root_3d_hpc.json` (HPC):
 
 ```json
 {
   "data": [
-    { "name": "BIrads", "path": "/path/to/processed_birads" },
-    { "name": "Class3", "path": "/path/to/processed_class3" },
-    { "name": "Class4", "path": "/path/to/processed_class4" },
-    { "name": "ABUS",   "path": "/path/to/processed_abus" }
+    { "name": "BIrads", "path": "/path/to/processed/BIrads" },
+    { "name": "Class2", "path": "/path/to/processed/Class2" },
+    { "name": "Class3", "path": "/path/to/processed/Class3" },
+    { "name": "Class4", "path": "/path/to/processed/Class4" },
+    { "name": "Abus",   "path": "/path/to/processed/Abus" },
+    { "name": "Duying", "path": "/path/to/processed/Duying" }
   ]
 }
 ```
@@ -483,20 +507,28 @@ Output:
 ```
 wds/
 ├── BIrads/shard-000000.tar ... shard-NNNNNN.tar
+├── Class2/shard-000000.tar ...
 ├── Class3/shard-000000.tar ...
 ├── Class4/shard-000000.tar ...
-├── ABUS/shard-000000.tar ...
+├── Abus/shard-000000.tar ...
+├── Duying/shard-000000.tar ...
 └── index.json
 ```
 
 ### Step 3: Train DINOv2 (self-supervised)
 
 ```bash
-# Single GPU
-python train_ultrassl.py --config config/ultrassl_vitb14_3d_labeled.yaml
+# Single GPU (debug/testing)
+python train_ultrassl.py --config config/ultrassl_vitb14_3d_labeled.yaml \
+    data.shard_dir=/path/to/shards
 
-# Multi-GPU
-torchrun --nproc_per_node=2 train_ultrassl.py --config config/ultrassl_vitb14_3d_labeled.yaml
+# Multi-GPU (recommended, 4 GPUs)
+torchrun --standalone --nproc_per_node=4 train_ultrassl.py \
+    --config config/ultrassl_vitb14_3d_labeled.yaml \
+    data.shard_dir=/path/to/shards
+
+# SLURM (HPC)
+sbatch scripts/train_dino.sbatch
 ```
 
 Override config values from CLI:
@@ -637,10 +669,10 @@ Or override from CLI: `model.arch=vit_large model.pretrained=dinov2_vitl14`.
 | `optim.epochs` | `50` | Domain adaptation, not from-scratch training |
 | `teacher.momentum_teacher` | `0.996` | Higher than DINOv2's 0.992 for stable adaptation |
 | `crops.local_crops_scale` | `[0.25, 0.6]` | Larger minimum than DINOv2's 0.05 to keep small lesions |
-| `crops.local_crops_number` | `3` | Fewer crops for memory efficiency |
+| `crops.local_crops_number` | `2` | 2 local crops for multi-GPU memory efficiency |
 | `ibot.loss_weight` | `1.0` | Kept strong for dense patch feature learning |
-| `train.batch_size_per_gpu` | `24` | Fits ViT-B/14 + 3 local crops on one GPU |
+| `train.batch_size_per_gpu` | `24` | Fits ViT-B/14 + 2 local crops on one GPU |
 | `data.shard_dir` | `""` | Set to shard directory to use WebDataset loading |
 | `data.balance_datasets` | `true` | Replicate smaller datasets' shards for balanced sampling |
-| `data.pos_enrichment` | `10.0` | Subsample negatives for ~1:1 Pos:Neg ratio in SSL |
+| `data.pos_enrichment` | `0.0` | 0 = use all slices for SSL (no negative subsampling) |
 | `augmentation.freq_augment_p` | `0.15` | Probability of applying frequency augmentation |

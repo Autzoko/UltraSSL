@@ -1,0 +1,28 @@
+{
+    "data": [
+        {
+            "name": "BIrads",
+            "path": "/scratch/ll5582/Data/Ultrasound/processed/BIrads"
+        },
+        {
+            "name": "Class2",
+            "path": "/scratch/ll5582/Data/Ultrasound/processed/Class2"
+        },
+        {
+            "name": "Class3",
+            "path": "/scratch/ll5582/Data/Ultrasound/processed/Class3"
+        },
+        {
+            "name": "Class4",
+            "path": "/scratch/ll5582/Data/Ultrasound/processed/Class4"
+        },
+        {
+            "name": "Abus",
+            "path": "/scratch/ll5582/Data/Ultrasound/processed/Abus"
+        },
+        {
+            "name": "Duying",
+            "path": "/scratch/ll5582/Data/Ultrasound/processed/Duying"
+        }
+    ]
+}

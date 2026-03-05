@@ -306,6 +306,7 @@ def train(cfg):
     # Choose data loading mode: WebDataset shards or raw image files
     shard_dir = data_cfg.get("shard_dir", "")
     use_webdataset = bool(shard_dir) and HAS_WEBDATASET
+    sampler = None  # Only used for standard (non-WebDataset) datasets
 
     if use_webdataset:
         # --- WebDataset mode: read from .tar shards ---
@@ -342,15 +343,18 @@ def train(cfg):
             )
 
         # Wrap with collation — WebDataset yields individual samples,
-        # we batch + collate them the same way as the standard pipeline
+        # we batch + collate them the same way as the standard pipeline.
+        # nodesplitter=wds.split_by_node in the pipeline handles both DDP
+        # rank distribution and DataLoader worker splitting.
+        effective_workers = min(cfg.train.num_workers, 8)  # cap to avoid shard starvation
         data_loader = DataLoader(
             wds_dataset,
             batch_size=cfg.train.batch_size_per_gpu,
-            num_workers=cfg.train.num_workers,
+            num_workers=effective_workers,
             collate_fn=collate_fn,
             drop_last=True,
             pin_memory=device.type == "cuda",
-            persistent_workers=cfg.train.num_workers > 0,
+            persistent_workers=effective_workers > 0,
         )
         dataset_size_str = f"WebDataset shards in {shard_dir}"
     else:
@@ -417,8 +421,10 @@ def train(cfg):
     raw_model.train()
     iteration = start_iter
 
+    effective_bs = cfg.train.batch_size_per_gpu * world_size
     logger.info(f"Starting training: {start_iter} -> {max_iter} iterations")
-    logger.info(f"  Dataset: {dataset_size_str}, Batch size: {cfg.train.batch_size_per_gpu}")
+    logger.info(f"  Dataset: {dataset_size_str}")
+    logger.info(f"  Batch size: {cfg.train.batch_size_per_gpu}/gpu × {world_size} GPUs = {effective_bs} effective")
     logger.info(f"  Epoch length: {epoch_len}, Total epochs: {cfg.optim.epochs}")
     logger.info(f"  AMP: {'enabled' if use_amp else 'disabled (non-CUDA device)'}")
 
@@ -429,7 +435,9 @@ def train(cfg):
         try:
             data = next(data_iter)
         except StopIteration:
-            if world_size > 1:
+            # WebDataset: shards reshuffle on iterator recreation.
+            # Standard dataset: update DistributedSampler epoch for proper shuffling.
+            if sampler is not None and world_size > 1:
                 epoch = iteration // epoch_len
                 sampler.set_epoch(epoch)
             data_iter = iter(data_loader)
