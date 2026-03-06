@@ -2,11 +2,11 @@
 #SBATCH --job-name=gdown
 #SBATCH --output=logs/gdown_%j.out
 #SBATCH --error=logs/gdown_%j.err
-#SBATCH --partition=cpu
+#SBATCH --partition=compute
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
-#SBATCH --mem=8G
+#SBATCH --mem=32G
 #SBATCH --time=24:00:00
 
 echo "Job ID: $SLURM_JOB_ID"
