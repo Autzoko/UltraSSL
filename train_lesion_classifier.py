@@ -345,8 +345,10 @@ def train_classifier(cfg):
                 patch_labels_list.append(pl)
                 image_labels_list.append(float(ann.get("has_lesion", 0)))
 
-            # Skip if all samples are from val set
+            # If all samples are from val set, do zero-loss backward to keep DDP in sync
             if not any(keep_mask):
+                optimizer.zero_grad()
+                (patch_logits.sum() * 0 + image_logit.sum() * 0).backward()
                 continue
 
             # Filter batch
