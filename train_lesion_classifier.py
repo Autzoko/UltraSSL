@@ -518,7 +518,7 @@ def evaluate(model, loader, device, val_volumes, cfg, grid_h, grid_w, ignore_mar
             n_batches += 1
             continue
 
-        val_idx_t = torch.tensor(val_indices, device=device)
+        val_idx_t = torch.tensor(val_indices)
         val_images = images[val_idx_t].to(device)
 
         _, image_logit = model(val_images)
