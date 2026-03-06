@@ -9,7 +9,7 @@
 
 # --- Backbone (frozen) ---
 backbone:
-  checkpoint: "outputs/ultrassl_vitb14_3d_labeled/teacher_backbone_latest.pth"
+  checkpoint: "/scratch/ll5582/Projects/UltraSSL/outputs/ultrassl_vitb14_3d_labeled/teacher_backbone_latest.pth"
   arch: vit_base
   patch_size: 14
   img_size: 224
@@ -30,7 +30,7 @@ optim:
 
 # --- Data ---
 data:
-  shard_dir: "wds/"
+  shard_dir: "/scratch/ll5582/Data/Ultrasound/Shards"
   datasets: null                 # null = all datasets
   batch_size: 32
   num_workers: 8
