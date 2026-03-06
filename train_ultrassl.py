@@ -26,8 +26,8 @@ project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "dinov2"))
 
-# Disable xformers — use PyTorch SDPA fallback
-os.environ.setdefault("XFORMERS_DISABLED", "1")
+# Allow xFormers if available; set XFORMERS_DISABLED=1 in env to disable
+# os.environ.setdefault("XFORMERS_DISABLED", "1")
 
 from ultrassl.train.trainer import train, load_config, setup_distributed, setup_logging
 

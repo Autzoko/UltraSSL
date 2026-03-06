@@ -35,7 +35,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "dinov2"))
-os.environ.setdefault("XFORMERS_DISABLED", "1")
+# Allow xFormers if available; set XFORMERS_DISABLED=1 in env to disable
+# os.environ.setdefault("XFORMERS_DISABLED", "1")
 
 from ultrassl.models.patch_classifier import PatchLesionClassifier, assign_patch_labels
 from ultrassl.data.wds_labeled_dataset import build_labeled_wds_dataset

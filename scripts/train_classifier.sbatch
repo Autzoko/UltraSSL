@@ -36,7 +36,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-export XFORMERS_DISABLED=1
+# export XFORMERS_DISABLED=1  # uncomment to force PyTorch SDPA fallback
 
 PROJECT_DIR=/scratch/ll5582/Projects/UltraSSL
 CONFIG=${PROJECT_DIR}/config/lesion_classifier.yaml

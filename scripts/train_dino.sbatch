@@ -50,7 +50,7 @@ echo "Conda environment activated successfully"
 echo "Python path: $(which python)"
 echo ""
 
-export XFORMERS_DISABLED=1
+# export XFORMERS_DISABLED=1  # uncomment to force PyTorch SDPA fallback
 
 # Change to project directory
 PROJECT_DIR=/scratch/ll5582/Projects/UltraSSL
