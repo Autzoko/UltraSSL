@@ -417,29 +417,50 @@ def train_classifier(cfg):
                     "lr": optimizer.param_groups[0]["lr"],
                 }) + "\n")
 
-        # Validation (rank 0 only)
-        if is_main and val_volumes is not None:
-            eval_model = raw_model
-            val_metrics = evaluate(eval_model, train_loader, device, val_volumes,
-                                   cfg, grid_h, grid_w, ignore_margin)
-            logger.info(
-                f"  Val: acc={val_metrics['accuracy']:.4f} "
-                f"sens={val_metrics['sensitivity']:.4f} "
-                f"spec={val_metrics['specificity']:.4f} "
-                f"auroc={val_metrics['auroc']:.4f}"
-            )
+        # Validation — all ranks participate to avoid NCCL timeout
+        if val_volumes is not None:
+            local_preds, local_labels = evaluate(
+                raw_model, train_loader, device, val_volumes,
+                cfg, grid_h, grid_w, ignore_margin)
 
-            if val_metrics["auroc"] > best_val_auroc:
-                best_val_auroc = val_metrics["auroc"]
-                save_path = os.path.join(output_dir, "best_model.pth")
-                torch.save({
-                    "head": raw_model.head.state_dict(),
-                    "attn_pool": raw_model.attn_pool.state_dict() if hasattr(raw_model, "attn_pool") else None,
-                    "epoch": epoch + 1,
-                    "val_auroc": best_val_auroc,
-                    "config": OmegaConf.to_container(cfg),
-                }, save_path)
-                logger.info(f"  New best model (AUROC={best_val_auroc:.4f}) saved to {save_path}")
+            # Gather predictions from all ranks to rank 0
+            if world_size > 1:
+                all_preds_gathered = [None] * world_size
+                all_labels_gathered = [None] * world_size
+                dist.all_gather_object(all_preds_gathered, local_preds)
+                dist.all_gather_object(all_labels_gathered, local_labels)
+                if is_main:
+                    gathered_preds = []
+                    gathered_labels = []
+                    for p, l in zip(all_preds_gathered, all_labels_gathered):
+                        gathered_preds.extend(p)
+                        gathered_labels.extend(l)
+                    val_metrics = compute_metrics(gathered_preds, gathered_labels)
+                else:
+                    val_metrics = None
+            else:
+                val_metrics = compute_metrics(local_preds, local_labels)
+
+            if is_main and val_metrics is not None:
+                logger.info(
+                    f"  Val: acc={val_metrics['accuracy']:.4f} "
+                    f"sens={val_metrics['sensitivity']:.4f} "
+                    f"spec={val_metrics['specificity']:.4f} "
+                    f"auroc={val_metrics['auroc']:.4f} "
+                    f"(n={val_metrics['n_samples']}, pos={val_metrics['n_positive']})"
+                )
+
+                if val_metrics["auroc"] > best_val_auroc:
+                    best_val_auroc = val_metrics["auroc"]
+                    save_path = os.path.join(output_dir, "best_model.pth")
+                    torch.save({
+                        "head": raw_model.head.state_dict(),
+                        "attn_pool": raw_model.attn_pool.state_dict() if hasattr(raw_model, "attn_pool") else None,
+                        "epoch": epoch + 1,
+                        "val_auroc": best_val_auroc,
+                        "config": OmegaConf.to_container(cfg),
+                    }, save_path)
+                    logger.info(f"  New best model (AUROC={best_val_auroc:.4f}) saved to {save_path}")
 
         # Periodic checkpoint (rank 0 only)
         if is_main and ((epoch + 1) % 5 == 0 or (epoch + 1) == total_epochs):
@@ -468,12 +489,16 @@ def train_classifier(cfg):
 
 @torch.no_grad()
 def evaluate(model, loader, device, val_volumes, cfg, grid_h, grid_w, ignore_margin):
-    """Evaluate on validation volumes (filtered from the shared loader)."""
+    """Collect predictions on val volumes from this rank's shard subset.
+
+    Returns:
+        (preds_list, labels_list): Raw predictions and labels for gathering across ranks.
+    """
     model.eval()
 
     all_preds = []
     all_labels = []
-    max_val_batches = 200
+    max_val_batches = 100  # each rank processes its own subset
 
     n_batches = 0
     for images, annotations in loader:
@@ -504,11 +529,15 @@ def evaluate(model, loader, device, val_volumes, cfg, grid_h, grid_w, ignore_mar
         n_batches += 1
 
     model.train()
+    return all_preds, all_labels
 
+
+def compute_metrics(all_preds, all_labels):
+    """Compute classification metrics from gathered predictions."""
     if len(all_preds) < 2 or sum(all_labels) == 0 or sum(all_labels) == len(all_labels):
-        return {"accuracy": 0.0, "sensitivity": 0.0, "specificity": 0.0, "auroc": 0.5}
+        return {"accuracy": 0.0, "sensitivity": 0.0, "specificity": 0.0,
+                "auroc": 0.5, "n_samples": len(all_preds), "n_positive": int(sum(all_labels))}
 
-    # Compute metrics
     preds = np.array(all_preds)
     labels = np.array(all_labels)
     binary_preds = (preds >= 0.5).astype(float)
@@ -522,7 +551,6 @@ def evaluate(model, loader, device, val_volumes, cfg, grid_h, grid_w, ignore_mar
     sensitivity = tp / max(1, tp + fn)
     specificity = tn / max(1, tn + fp)
 
-    # AUROC
     try:
         from sklearn.metrics import roc_auc_score
         auroc = roc_auc_score(labels, preds)
