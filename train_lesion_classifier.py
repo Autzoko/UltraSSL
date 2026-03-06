@@ -6,12 +6,12 @@ Uses bbox annotations to supervise patch-level predictions, then aggregates
 via MIL (multiple instance learning) pooling for image-level has_lesion
 classification. Designed to reduce false positives on negative slices.
 
-Usage:
-    python train_lesion_classifier.py --config config/lesion_classifier.yaml
+Supports multi-GPU training via torchrun:
+    torchrun --nproc_per_node=4 train_lesion_classifier.py \
+        --config config/lesion_classifier.yaml
 
-    # Override config values
-    python train_lesion_classifier.py --config config/lesion_classifier.yaml \
-        optim.epochs=50 classifier.mil_type=attention
+Single-GPU:
+    python train_lesion_classifier.py --config config/lesion_classifier.yaml
 """
 
 import argparse
@@ -19,15 +19,17 @@ import json
 import logging
 import math
 import os
+import pickle
 import random
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from omegaconf import OmegaConf
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Ensure project root is on path
 project_root = Path(__file__).resolve().parent
@@ -39,6 +41,29 @@ from ultrassl.models.patch_classifier import PatchLesionClassifier, assign_patch
 from ultrassl.data.wds_labeled_dataset import build_labeled_wds_dataset
 
 logger = logging.getLogger("ultrassl")
+
+
+# ── Distributed helpers ──────────────────────────────────────────────
+
+def setup_distributed():
+    """Initialize DDP if launched via torchrun, otherwise single-GPU."""
+    if "RANK" in os.environ:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        return rank, local_rank, world_size
+    return 0, 0, 1
+
+
+def is_main_process(rank):
+    return rank == 0
+
+
+def cleanup_distributed(world_size):
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -53,12 +78,10 @@ def load_config(config_path, cli_opts=None):
 
 # ── Volume-aware train/val split ─────────────────────────────────────
 
-def load_volume_split(shard_dir, val_split=0.15, seed=42):
+def load_volume_split(shard_dir, val_split=0.15, seed=42, rank=0, world_size=1):
     """Split volumes into train/val sets, stratified by dataset.
 
-    Scans shard annotations to collect per-volume info, then performs a
-    per-dataset stratified split so the validation set has proportional
-    representation from each dataset (BIrads, Class3, Class4, ABUS).
+    Scans shard annotations on rank 0 only, then broadcasts to all ranks.
 
     Returns:
         train_volumes: set of sample_id strings for training
@@ -68,63 +91,78 @@ def load_volume_split(shard_dir, val_split=0.15, seed=42):
     import tarfile
     from collections import defaultdict
 
-    # Scan shards to collect volume info: (sample_id -> {dataset, n_positive})
-    volume_info = {}  # sample_id -> {"dataset": str, "n_positive": int}
+    train_volumes = None
+    val_volumes = None
 
-    shard_files = sorted(glob.glob(os.path.join(shard_dir, "*/shard-*.tar")))
-    if not shard_files:
-        logger.warning(f"No shard files found under {shard_dir}. "
-                       "Using all data for training (no validation).")
-        return None, None
+    if rank == 0:
+        # Scan shards to collect volume info
+        volume_info = {}
 
-    for shard_path in shard_files:
-        try:
-            with tarfile.open(shard_path, "r") as tar:
-                for member in tar.getmembers():
-                    if not member.name.endswith(".json"):
-                        continue
-                    f = tar.extractfile(member)
-                    if f is None:
-                        continue
-                    ann = json.loads(f.read().decode())
-                    sid = ann.get("sample_id", "")
-                    ds_name = ann.get("dataset", "unknown")
-                    has_lesion = ann.get("has_lesion", 0)
-                    if sid not in volume_info:
-                        volume_info[sid] = {"dataset": ds_name, "n_positive": 0}
-                    volume_info[sid]["n_positive"] += has_lesion
-        except Exception as e:
-            logger.warning(f"Error reading {shard_path}: {e}")
+        shard_files = sorted(glob.glob(os.path.join(shard_dir, "*/shard-*.tar")))
+        if not shard_files:
+            logger.warning(f"No shard files found under {shard_dir}. "
+                           "Using all data for training (no validation).")
+        else:
+            for shard_path in shard_files:
+                try:
+                    with tarfile.open(shard_path, "r") as tar:
+                        for member in tar.getmembers():
+                            if not member.name.endswith(".json"):
+                                continue
+                            f = tar.extractfile(member)
+                            if f is None:
+                                continue
+                            ann = json.loads(f.read().decode())
+                            sid = ann.get("sample_id", "")
+                            ds_name = ann.get("dataset", "unknown")
+                            has_lesion = ann.get("has_lesion", 0)
+                            if sid not in volume_info:
+                                volume_info[sid] = {"dataset": ds_name, "n_positive": 0}
+                            volume_info[sid]["n_positive"] += has_lesion
+                except Exception as e:
+                    logger.warning(f"Error reading {shard_path}: {e}")
 
-    if not volume_info:
-        logger.warning("No volume info found. Using all data for training.")
-        return None, None
+            if volume_info:
+                by_dataset = defaultdict(list)
+                for sid, info in volume_info.items():
+                    by_dataset[info["dataset"]].append(sid)
 
-    # Group volumes by dataset for stratified splitting
-    by_dataset = defaultdict(list)
-    for sid, info in volume_info.items():
-        by_dataset[info["dataset"]].append(sid)
+                rng = random.Random(seed)
+                train_volumes = set()
+                val_volumes = set()
 
-    rng = random.Random(seed)
-    train_volumes = set()
-    val_volumes = set()
+                for ds_name in sorted(by_dataset.keys()):
+                    ds_volumes = sorted(by_dataset[ds_name])
+                    rng.shuffle(ds_volumes)
+                    n_val = max(1, int(len(ds_volumes) * val_split))
+                    val_volumes.update(ds_volumes[:n_val])
+                    train_volumes.update(ds_volumes[n_val:])
 
-    for ds_name in sorted(by_dataset.keys()):
-        ds_volumes = sorted(by_dataset[ds_name])
-        rng.shuffle(ds_volumes)
-        n_val = max(1, int(len(ds_volumes) * val_split))
-        val_volumes.update(ds_volumes[:n_val])
-        train_volumes.update(ds_volumes[n_val:])
+                n_pos_train = sum(volume_info[v]["n_positive"] for v in train_volumes)
+                n_pos_val = sum(volume_info[v]["n_positive"] for v in val_volumes)
 
-    n_pos_train = sum(volume_info[v]["n_positive"] for v in train_volumes)
-    n_pos_val = sum(volume_info[v]["n_positive"] for v in val_volumes)
+                logger.info(f"Volume split: {len(train_volumes)} train, {len(val_volumes)} val")
+                for ds_name in sorted(by_dataset.keys()):
+                    n_train_ds = len([v for v in train_volumes if volume_info[v]["dataset"] == ds_name])
+                    n_val_ds = len([v for v in val_volumes if volume_info[v]["dataset"] == ds_name])
+                    logger.info(f"  {ds_name}: {n_train_ds} train, {n_val_ds} val")
+                logger.info(f"  Train positive slices: {n_pos_train}, Val positive slices: {n_pos_val}")
+            else:
+                logger.warning("No volume info found. Using all data for training.")
 
-    logger.info(f"Volume split: {len(train_volumes)} train, {len(val_volumes)} val")
-    for ds_name in sorted(by_dataset.keys()):
-        n_train_ds = len([v for v in train_volumes if volume_info[v]["dataset"] == ds_name])
-        n_val_ds = len([v for v in val_volumes if volume_info[v]["dataset"] == ds_name])
-        logger.info(f"  {ds_name}: {n_train_ds} train, {n_val_ds} val")
-    logger.info(f"  Train positive slices: {n_pos_train}, Val positive slices: {n_pos_val}")
+    # Broadcast split to all ranks
+    if world_size > 1:
+        data = pickle.dumps((train_volumes, val_volumes))
+        size = torch.tensor([len(data)], dtype=torch.long, device="cuda")
+        dist.broadcast(size, src=0)
+        if rank != 0:
+            data = bytes(size.item())
+        buf = torch.ByteTensor(list(data)).cuda()
+        if rank != 0:
+            buf = torch.zeros(size.item(), dtype=torch.uint8, device="cuda")
+        dist.broadcast(buf, src=0)
+        if rank != 0:
+            train_volumes, val_volumes = pickle.loads(buf.cpu().numpy().tobytes())
 
     return train_volumes, val_volumes
 
@@ -133,24 +171,32 @@ def load_volume_split(shard_dir, val_split=0.15, seed=42):
 
 def train_classifier(cfg):
     """Main training loop for the patch-level lesion classifier."""
-    # Device
-    if torch.cuda.is_available():
+    # DDP setup
+    rank, local_rank, world_size = setup_distributed()
+    is_main = is_main_process(rank)
+
+    if world_size > 1:
+        device = torch.device(f"cuda:{local_rank}")
+    elif torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-    logger.info(f"Using device: {device}")
+
+    if is_main:
+        logger.info(f"Using device: {device}, world_size: {world_size}")
 
     # Seed
     seed = cfg.train.get("seed", 42)
-    torch.manual_seed(seed)
-    random.seed(seed)
-    np.random.seed(seed)
+    torch.manual_seed(seed + rank)
+    random.seed(seed + rank)
+    np.random.seed(seed + rank)
 
     # Output dir
     output_dir = cfg.train.output_dir
-    os.makedirs(output_dir, exist_ok=True)
+    if is_main:
+        os.makedirs(output_dir, exist_ok=True)
 
     # Resolve shard_dir
     shard_dir = cfg.data.shard_dir
@@ -174,9 +220,16 @@ def train_classifier(cfg):
     )
     model.to(device)
 
+    # Wrap in DDP — only head params have gradients, backbone is frozen
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        raw_model = model.module
+    else:
+        raw_model = model
+
     # Optimizer — only head parameters
     optimizer = torch.optim.AdamW(
-        model.get_trainable_params(),
+        raw_model.get_trainable_params(),
         lr=cfg.optim.lr,
         weight_decay=cfg.optim.get("weight_decay", 1e-4),
     )
@@ -211,9 +264,10 @@ def train_classifier(cfg):
     if datasets_filter is not None:
         datasets_filter = list(datasets_filter)
 
-    # Volume-aware split
+    # Volume-aware split (rank 0 scans, broadcasts to all)
     train_volumes, val_volumes = load_volume_split(
-        shard_dir, val_split=cfg.eval.get("val_split", 0.15), seed=seed)
+        shard_dir, val_split=cfg.eval.get("val_split", 0.15),
+        seed=seed, rank=rank, world_size=world_size)
 
     # Estimate epoch length from index.json
     index_path = os.path.join(shard_dir, "index.json")
@@ -223,7 +277,7 @@ def train_classifier(cfg):
             index = json.load(f)
         for ds_stats in index.values():
             total_slices += ds_stats.get("n_slices_total", 0)
-    epoch_length = max(100, total_slices // cfg.data.batch_size)
+    epoch_length = max(100, total_slices // (cfg.data.batch_size * world_size))
 
     _, train_loader = build_labeled_wds_dataset(
         shard_dir=shard_dir,
@@ -240,9 +294,12 @@ def train_classifier(cfg):
     log_every = cfg.train.get("log_every", 50)
     best_val_auroc = 0.0
 
-    logger.info(f"Training for {total_epochs} epochs, ~{epoch_length} batches/epoch")
-    logger.info(f"Patch loss weight: {patch_loss_weight}, Image loss weight: {image_loss_weight}")
-    logger.info(f"Pos weight: {cfg.loss.pos_weight}, Ignore margin: {ignore_margin}")
+    if is_main:
+        logger.info(f"Training for {total_epochs} epochs, ~{epoch_length} batches/epoch")
+        logger.info(f"Batch size: {cfg.data.batch_size}/gpu x {world_size} GPUs = "
+                     f"{cfg.data.batch_size * world_size} effective")
+        logger.info(f"Patch loss weight: {patch_loss_weight}, Image loss weight: {image_loss_weight}")
+        logger.info(f"Pos weight: {cfg.loss.pos_weight}, Ignore margin: {ignore_margin}")
 
     # Training loop
     metrics_file = os.path.join(output_dir, "training_metrics.jsonl")
@@ -259,12 +316,11 @@ def train_classifier(cfg):
 
             # Forward
             patch_logits, image_logit = model(images)
-            # patch_logits: (B, 256, 1), image_logit: (B, 1)
 
             # Assign patch-level labels from bboxes
             patch_labels_list = []
             image_labels_list = []
-            keep_mask = []  # for volume-aware filtering
+            keep_mask = []
 
             for ann in annotations:
                 # Volume split filtering
@@ -299,12 +355,12 @@ def train_classifier(cfg):
                 patch_logits = patch_logits[keep_t]
                 image_logit = image_logit[keep_t]
 
-            patch_labels = torch.stack(patch_labels_list).to(device)  # (B', 256)
-            image_labels = torch.tensor(image_labels_list, device=device).unsqueeze(1)  # (B', 1)
+            patch_labels = torch.stack(patch_labels_list).to(device)
+            image_labels = torch.tensor(image_labels_list, device=device).unsqueeze(1)
 
             # Patch loss (with ignore masking where label == -1)
-            valid_mask = (patch_labels >= 0)  # True for non-ignore patches
-            patch_targets = patch_labels.clamp(min=0)  # -1 -> 0 for BCE (masked out anyway)
+            valid_mask = (patch_labels >= 0)
+            patch_targets = patch_labels.clamp(min=0)
             patch_loss_raw = patch_bce(patch_logits.squeeze(-1), patch_targets)
             patch_loss = (patch_loss_raw * valid_mask).sum() / valid_mask.sum().clamp(min=1)
 
@@ -326,7 +382,7 @@ def train_classifier(cfg):
             epoch_metrics["n_positive_slices"] += int(image_labels.sum().item())
             epoch_metrics["n_negative_slices"] += int((1 - image_labels).sum().item())
 
-            if (batch_idx + 1) % log_every == 0:
+            if is_main and (batch_idx + 1) % log_every == 0:
                 avg_loss = epoch_metrics["total_loss"] / epoch_metrics["n_batches"]
                 avg_ploss = epoch_metrics["patch_loss"] / epoch_metrics["n_batches"]
                 avg_iloss = epoch_metrics["image_loss"] / epoch_metrics["n_batches"]
@@ -338,30 +394,32 @@ def train_classifier(cfg):
 
         scheduler.step()
 
-        # Epoch summary
-        n = max(1, epoch_metrics["n_batches"])
-        logger.info(
-            f"Epoch {epoch+1}/{total_epochs}: "
-            f"loss={epoch_metrics['total_loss']/n:.4f} "
-            f"(patch={epoch_metrics['patch_loss']/n:.4f}, "
-            f"image={epoch_metrics['image_loss']/n:.4f}) "
-            f"pos_slices={epoch_metrics['n_positive_slices']}, "
-            f"neg_slices={epoch_metrics['n_negative_slices']}"
-        )
+        # Epoch summary (rank 0 only)
+        if is_main:
+            n = max(1, epoch_metrics["n_batches"])
+            logger.info(
+                f"Epoch {epoch+1}/{total_epochs}: "
+                f"loss={epoch_metrics['total_loss']/n:.4f} "
+                f"(patch={epoch_metrics['patch_loss']/n:.4f}, "
+                f"image={epoch_metrics['image_loss']/n:.4f}) "
+                f"pos_slices={epoch_metrics['n_positive_slices']}, "
+                f"neg_slices={epoch_metrics['n_negative_slices']}"
+            )
 
-        # Log to file
-        with open(metrics_file, "a") as f:
-            f.write(json.dumps({
-                "epoch": epoch + 1,
-                "patch_loss": epoch_metrics["patch_loss"] / n,
-                "image_loss": epoch_metrics["image_loss"] / n,
-                "total_loss": epoch_metrics["total_loss"] / n,
-                "lr": optimizer.param_groups[0]["lr"],
-            }) + "\n")
+            # Log to file
+            with open(metrics_file, "a") as f:
+                f.write(json.dumps({
+                    "epoch": epoch + 1,
+                    "patch_loss": epoch_metrics["patch_loss"] / n,
+                    "image_loss": epoch_metrics["image_loss"] / n,
+                    "total_loss": epoch_metrics["total_loss"] / n,
+                    "lr": optimizer.param_groups[0]["lr"],
+                }) + "\n")
 
-        # Validation
-        if val_volumes is not None:
-            val_metrics = evaluate(model, train_loader, device, val_volumes,
+        # Validation (rank 0 only)
+        if is_main and val_volumes is not None:
+            eval_model = raw_model
+            val_metrics = evaluate(eval_model, train_loader, device, val_volumes,
                                    cfg, grid_h, grid_w, ignore_margin)
             logger.info(
                 f"  Val: acc={val_metrics['accuracy']:.4f} "
@@ -374,28 +432,35 @@ def train_classifier(cfg):
                 best_val_auroc = val_metrics["auroc"]
                 save_path = os.path.join(output_dir, "best_model.pth")
                 torch.save({
-                    "head": model.head.state_dict(),
-                    "attn_pool": model.attn_pool.state_dict() if hasattr(model, "attn_pool") else None,
+                    "head": raw_model.head.state_dict(),
+                    "attn_pool": raw_model.attn_pool.state_dict() if hasattr(raw_model, "attn_pool") else None,
                     "epoch": epoch + 1,
                     "val_auroc": best_val_auroc,
                     "config": OmegaConf.to_container(cfg),
                 }, save_path)
                 logger.info(f"  New best model (AUROC={best_val_auroc:.4f}) saved to {save_path}")
 
-        # Periodic checkpoint
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == total_epochs:
+        # Periodic checkpoint (rank 0 only)
+        if is_main and ((epoch + 1) % 5 == 0 or (epoch + 1) == total_epochs):
             save_path = os.path.join(output_dir, f"checkpoint_epoch{epoch+1:03d}.pth")
             torch.save({
-                "head": model.head.state_dict(),
-                "attn_pool": model.attn_pool.state_dict() if hasattr(model, "attn_pool") else None,
+                "head": raw_model.head.state_dict(),
+                "attn_pool": raw_model.attn_pool.state_dict() if hasattr(raw_model, "attn_pool") else None,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch + 1,
                 "config": OmegaConf.to_container(cfg),
             }, save_path)
 
-    logger.info(f"Training complete. Best val AUROC: {best_val_auroc:.4f}")
-    logger.info(f"Outputs saved to: {output_dir}")
+        # Sync all ranks before next epoch
+        if world_size > 1:
+            dist.barrier()
+
+    if is_main:
+        logger.info(f"Training complete. Best val AUROC: {best_val_auroc:.4f}")
+        logger.info(f"Outputs saved to: {output_dir}")
+
+    cleanup_distributed(world_size)
 
 
 # ── Evaluation ────────────────────────────────────────────────────────
@@ -407,7 +472,7 @@ def evaluate(model, loader, device, val_volumes, cfg, grid_h, grid_w, ignore_mar
 
     all_preds = []
     all_labels = []
-    max_val_batches = 200  # cap to avoid re-reading all data
+    max_val_batches = 200
 
     n_batches = 0
     for images, annotations in loader:
@@ -461,7 +526,6 @@ def evaluate(model, loader, device, val_volumes, cfg, grid_h, grid_w, ignore_mar
         from sklearn.metrics import roc_auc_score
         auroc = roc_auc_score(labels, preds)
     except Exception:
-        # Manual AUROC if sklearn not available
         auroc = _manual_auroc(labels, preds)
 
     return {
@@ -499,15 +563,17 @@ def main():
     cli_opts = [o for o in args.opts if o and o != "--"]
     cfg = load_config(args.config, cli_opts)
 
-    # Setup logging
+    # Setup logging (only rank 0 writes to file)
+    rank = int(os.environ.get("RANK", 0))
     os.makedirs(cfg.train.output_dir, exist_ok=True)
+    handlers = [logging.StreamHandler()]
+    if rank == 0:
+        handlers.append(logging.FileHandler(
+            os.path.join(cfg.train.output_dir, "train.log")))
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.INFO if rank == 0 else logging.WARNING,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(os.path.join(cfg.train.output_dir, "train.log")),
-        ],
+        handlers=handlers,
     )
 
     train_classifier(cfg)
