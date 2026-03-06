@@ -2,12 +2,12 @@
 #SBATCH --job-name=gdown
 #SBATCH --output=logs/gdown_%j.out
 #SBATCH --error=logs/gdown_%j.err
-#SBATCH --partition=nvidia
+#SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
-#SBATCH --time=02:00:00
+#SBATCH --time=24:00:00
 
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
