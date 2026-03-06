@@ -6,7 +6,8 @@ Uses bbox annotations to supervise patch-level predictions, then aggregates
 via MIL (multiple instance learning) pooling for image-level has_lesion
 classification. Designed to reduce false positives on negative slices.
 
-Supports multi-GPU training via torchrun:
+Multi-GPU via torchrun (no DDP — backbone is frozen, each GPU trains
+its own copy of the small MLP head on different data shards):
     torchrun --nproc_per_node=4 train_lesion_classifier.py \
         --config config/lesion_classifier.yaml
 
@@ -29,14 +30,11 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from omegaconf import OmegaConf
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Ensure project root is on path
 project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "dinov2"))
-# Allow xFormers if available; set XFORMERS_DISABLED=1 in env to disable
-# os.environ.setdefault("XFORMERS_DISABLED", "1")
 
 from ultrassl.models.patch_classifier import PatchLesionClassifier, assign_patch_labels
 from ultrassl.data.wds_labeled_dataset import build_labeled_wds_dataset
@@ -47,12 +45,17 @@ logger = logging.getLogger("ultrassl")
 # ── Distributed helpers ──────────────────────────────────────────────
 
 def setup_distributed():
-    """Initialize DDP if launched via torchrun, otherwise single-GPU."""
+    """Initialize process group for multi-GPU (gloo backend, no NCCL).
+
+    We use gloo for lightweight communication (volume split broadcast,
+    val metric gathering) but NO DDP gradient sync — each GPU trains
+    independently on its own data shard.
+    """
     if "RANK" in os.environ:
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="gloo")
         torch.cuda.set_device(local_rank)
         return rank, local_rank, world_size
     return 0, 0, 1
@@ -83,10 +86,6 @@ def load_volume_split(shard_dir, val_split=0.15, seed=42, rank=0, world_size=1):
     """Split volumes into train/val sets, stratified by dataset.
 
     Scans shard annotations on rank 0 only, then broadcasts to all ranks.
-
-    Returns:
-        train_volumes: set of sample_id strings for training
-        val_volumes: set of sample_id strings for validation
     """
     import glob
     import tarfile
@@ -96,9 +95,7 @@ def load_volume_split(shard_dir, val_split=0.15, seed=42, rank=0, world_size=1):
     val_volumes = None
 
     if rank == 0:
-        # Scan shards to collect volume info
         volume_info = {}
-
         shard_files = sorted(glob.glob(os.path.join(shard_dir, "*/shard-*.tar")))
         if not shard_files:
             logger.warning(f"No shard files found under {shard_dir}. "
@@ -151,19 +148,19 @@ def load_volume_split(shard_dir, val_split=0.15, seed=42, rank=0, world_size=1):
             else:
                 logger.warning("No volume info found. Using all data for training.")
 
-    # Broadcast split to all ranks
+    # Broadcast split to all ranks via gloo
     if world_size > 1:
         data = pickle.dumps((train_volumes, val_volumes))
-        size = torch.tensor([len(data)], dtype=torch.long, device="cuda")
-        dist.broadcast(size, src=0)
-        if rank != 0:
-            data = bytes(size.item())
-        buf = torch.ByteTensor(list(data)).cuda()
-        if rank != 0:
-            buf = torch.zeros(size.item(), dtype=torch.uint8, device="cuda")
+        size_tensor = torch.tensor([len(data)], dtype=torch.long)
+        dist.broadcast(size_tensor, src=0)
+        buf_size = size_tensor.item()
+        if rank == 0:
+            buf = torch.ByteTensor(list(data))
+        else:
+            buf = torch.zeros(buf_size, dtype=torch.uint8)
         dist.broadcast(buf, src=0)
         if rank != 0:
-            train_volumes, val_volumes = pickle.loads(buf.cpu().numpy().tobytes())
+            train_volumes, val_volumes = pickle.loads(buf.numpy().tobytes())
 
     return train_volumes, val_volumes
 
@@ -171,8 +168,12 @@ def load_volume_split(shard_dir, val_split=0.15, seed=42, rank=0, world_size=1):
 # ── Training ──────────────────────────────────────────────────────────
 
 def train_classifier(cfg):
-    """Main training loop for the patch-level lesion classifier."""
-    # DDP setup
+    """Main training loop for the patch-level lesion classifier.
+
+    No DDP — backbone is frozen and the MLP head is tiny (197K params).
+    Each GPU trains independently on its own WebDataset shard subset.
+    Validation predictions are gathered across ranks via gloo.
+    """
     rank, local_rank, world_size = setup_distributed()
     is_main = is_main_process(rank)
 
@@ -199,16 +200,16 @@ def train_classifier(cfg):
     if is_main:
         os.makedirs(output_dir, exist_ok=True)
 
-    # Resolve shard_dir
+    # Resolve paths
     shard_dir = cfg.data.shard_dir
     if not os.path.isabs(shard_dir):
         shard_dir = os.path.join(str(project_root), shard_dir)
 
-    # Build model
     backbone_ckpt = cfg.backbone.checkpoint
     if not os.path.isabs(backbone_ckpt):
         backbone_ckpt = os.path.join(str(project_root), backbone_ckpt)
 
+    # Build model (no DDP wrapper)
     model = PatchLesionClassifier(
         backbone_checkpoint=backbone_ckpt,
         arch=cfg.backbone.arch,
@@ -221,16 +222,9 @@ def train_classifier(cfg):
     )
     model.to(device)
 
-    # Wrap in DDP — only head params have gradients, backbone is frozen
-    if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-        raw_model = model.module
-    else:
-        raw_model = model
-
     # Optimizer — only head parameters
     optimizer = torch.optim.AdamW(
-        raw_model.get_trainable_params(),
+        model.get_trainable_params(),
         lr=cfg.optim.lr,
         weight_decay=cfg.optim.get("weight_decay", 1e-4),
     )
@@ -260,17 +254,17 @@ def train_classifier(cfg):
     grid_h = cfg.backbone.img_size // cfg.backbone.patch_size
     grid_w = grid_h
 
-    # Data — build train loader
+    # Data
     datasets_filter = cfg.data.get("datasets", None)
     if datasets_filter is not None:
         datasets_filter = list(datasets_filter)
 
-    # Volume-aware split (rank 0 scans, broadcasts to all)
+    # Volume-aware split (rank 0 scans, broadcasts via gloo)
     train_volumes, val_volumes = load_volume_split(
         shard_dir, val_split=cfg.eval.get("val_split", 0.15),
         seed=seed, rank=rank, world_size=world_size)
 
-    # Estimate epoch length from index.json
+    # Estimate epoch length
     index_path = os.path.join(shard_dir, "index.json")
     total_slices = 0
     if os.path.exists(index_path):
@@ -296,13 +290,12 @@ def train_classifier(cfg):
     best_val_auroc = 0.0
 
     if is_main:
-        logger.info(f"Training for {total_epochs} epochs, ~{epoch_length} batches/epoch")
+        logger.info(f"Training for {total_epochs} epochs, ~{epoch_length} batches/epoch/gpu")
         logger.info(f"Batch size: {cfg.data.batch_size}/gpu x {world_size} GPUs = "
                      f"{cfg.data.batch_size * world_size} effective")
         logger.info(f"Patch loss weight: {patch_loss_weight}, Image loss weight: {image_loss_weight}")
         logger.info(f"Pos weight: {cfg.loss.pos_weight}, Ignore margin: {ignore_margin}")
 
-    # Training loop
     metrics_file = os.path.join(output_dir, "training_metrics.jsonl")
 
     for epoch in range(total_epochs):
@@ -324,7 +317,6 @@ def train_classifier(cfg):
             keep_mask = []
 
             for ann in annotations:
-                # Volume split filtering
                 if train_volumes is not None:
                     sid = ann.get("sample_id", "")
                     if sid in val_volumes:
@@ -345,10 +337,8 @@ def train_classifier(cfg):
                 patch_labels_list.append(pl)
                 image_labels_list.append(float(ann.get("has_lesion", 0)))
 
-            # If all samples are from val set, do zero-loss backward to keep DDP in sync
+            # Skip if all samples are from val set
             if not any(keep_mask):
-                optimizer.zero_grad()
-                (patch_logits.sum() * 0 + image_logit.sum() * 0).backward()
                 continue
 
             # Filter batch
@@ -397,7 +387,7 @@ def train_classifier(cfg):
 
         scheduler.step()
 
-        # Epoch summary (rank 0 only)
+        # Epoch summary
         if is_main:
             n = max(1, epoch_metrics["n_batches"])
             logger.info(
@@ -409,7 +399,6 @@ def train_classifier(cfg):
                 f"neg_slices={epoch_metrics['n_negative_slices']}"
             )
 
-            # Log to file
             with open(metrics_file, "a") as f:
                 f.write(json.dumps({
                     "epoch": epoch + 1,
@@ -419,13 +408,11 @@ def train_classifier(cfg):
                     "lr": optimizer.param_groups[0]["lr"],
                 }) + "\n")
 
-        # Validation — all ranks participate to avoid NCCL timeout
+        # Validation — all ranks evaluate, gather predictions via gloo
         if val_volumes is not None:
             local_preds, local_labels = evaluate(
-                raw_model, train_loader, device, val_volumes,
-                cfg, grid_h, grid_w, ignore_margin)
+                model, train_loader, device, val_volumes)
 
-            # Gather predictions from all ranks to rank 0
             if world_size > 1:
                 all_preds_gathered = [None] * world_size
                 all_labels_gathered = [None] * world_size
@@ -456,8 +443,8 @@ def train_classifier(cfg):
                     best_val_auroc = val_metrics["auroc"]
                     save_path = os.path.join(output_dir, "best_model.pth")
                     torch.save({
-                        "head": raw_model.head.state_dict(),
-                        "attn_pool": raw_model.attn_pool.state_dict() if hasattr(raw_model, "attn_pool") else None,
+                        "head": model.head.state_dict(),
+                        "attn_pool": model.attn_pool.state_dict() if hasattr(model, "attn_pool") else None,
                         "epoch": epoch + 1,
                         "val_auroc": best_val_auroc,
                         "config": OmegaConf.to_container(cfg),
@@ -468,15 +455,15 @@ def train_classifier(cfg):
         if is_main and ((epoch + 1) % 5 == 0 or (epoch + 1) == total_epochs):
             save_path = os.path.join(output_dir, f"checkpoint_epoch{epoch+1:03d}.pth")
             torch.save({
-                "head": raw_model.head.state_dict(),
-                "attn_pool": raw_model.attn_pool.state_dict() if hasattr(raw_model, "attn_pool") else None,
+                "head": model.head.state_dict(),
+                "attn_pool": model.attn_pool.state_dict() if hasattr(model, "attn_pool") else None,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch + 1,
                 "config": OmegaConf.to_container(cfg),
             }, save_path)
 
-        # Sync all ranks before next epoch
+        # Lightweight sync between epochs
         if world_size > 1:
             dist.barrier()
 
@@ -490,24 +477,19 @@ def train_classifier(cfg):
 # ── Evaluation ────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate(model, loader, device, val_volumes, cfg, grid_h, grid_w, ignore_margin):
-    """Collect predictions on val volumes from this rank's shard subset.
-
-    Returns:
-        (preds_list, labels_list): Raw predictions and labels for gathering across ranks.
-    """
+def evaluate(model, loader, device, val_volumes):
+    """Collect predictions on val volumes from this rank's shard subset."""
     model.eval()
 
     all_preds = []
     all_labels = []
-    max_val_batches = 100  # each rank processes its own subset
+    max_val_batches = 100
 
     n_batches = 0
     for images, annotations in loader:
         if n_batches >= max_val_batches:
             break
 
-        # Filter to val volumes only
         val_indices = []
         val_image_labels = []
         for i, ann in enumerate(annotations):
@@ -594,7 +576,6 @@ def main():
     cli_opts = [o for o in args.opts if o and o != "--"]
     cfg = load_config(args.config, cli_opts)
 
-    # Setup logging (only rank 0 writes to file)
     rank = int(os.environ.get("RANK", 0))
     os.makedirs(cfg.train.output_dir, exist_ok=True)
     handlers = [logging.StreamHandler()]
