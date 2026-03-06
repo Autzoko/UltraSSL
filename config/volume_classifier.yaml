@@ -1,0 +1,79 @@
+# Volume-level MIL classifier for breast ultrasound
+#
+# Supports 3 training scripts:
+#   - joint_volume_classifier.py     (binary + multi-class)
+#   - lesion_presence_classifier.py  (binary only)
+#   - lesion_subtype_classifier.py   (multi-class only, positive volumes)
+#
+# Usage:
+#   # 1. Extract embeddings first (one-time):
+#   python extract_embeddings.py --config config/volume_classifier.yaml \
+#       --output-dir ./embedding_cache
+#
+#   # 2. Train (cached, fast):
+#   torchrun --nproc_per_node=4 joint_volume_classifier.py \
+#       --config config/volume_classifier.yaml data.cache_dir=./embedding_cache
+#
+#   # 3. Train (on-the-fly, no cache needed):
+#   torchrun --nproc_per_node=4 lesion_presence_classifier.py \
+#       --config config/volume_classifier.yaml
+
+# --- Backbone (frozen, for embedding extraction) ---
+backbone:
+  checkpoint: "/scratch/ll5582/Projects/UltraSSL/outputs/ultrassl_vitb14_3d_labeled/teacher_backbone_latest.pth"
+  arch: vit_base
+  patch_size: 14
+  img_size: 224
+
+# --- Volume MIL classifier ---
+classifier:
+  mil_type: "gated_attention"    # "gated_attention" or "topk"
+  hidden_dim: 256
+  topk: 8                       # only used when mil_type="topk"
+  dropout: 0.25
+  max_slices: 32                 # max slices per volume (pad/subsample)
+  n_classes: 3                   # Class2=0, Class3=1, Class4=2
+
+# --- Data ---
+data:
+  shard_dir: "/scratch/ll5582/Data/Ultrasound/Shards"
+  cache_dir: ""                  # empty = on-the-fly; path = cached embeddings
+  datasets: null                 # null = all datasets
+  batch_size: 16                 # volumes per batch (per GPU)
+  num_workers: 4
+
+# --- Class mapping (dataset folder name -> class index) ---
+class_mapping:
+  Class2: 0
+  Class3: 1
+  Class4: 2
+  # BIrads, Abus, Duying: not listed -> class_idx = -1 (ignored in class loss)
+
+# --- Loss ---
+loss:
+  binary_loss: "focal"           # "focal" or "bce"
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  binary_pos_weight: 3.0         # additional weight for positive class
+  multiclass_loss: "ce"          # "ce" or "focal"
+  class_weights: null            # null = auto-compute from data, or [1.0, 1.5, 2.0]
+  binary_loss_weight: 1.0
+  multiclass_loss_weight: 0.5
+
+# --- Optimizer ---
+optim:
+  lr: 5.0e-4
+  weight_decay: 1.0e-3
+  epochs: 50
+  warmup_epochs: 5
+
+# --- Training ---
+train:
+  output_dir: ./outputs/volume_classifier
+  seed: 42
+  log_every: 10
+  use_amp: true                  # auto-disabled on non-CUDA
+
+# --- Evaluation ---
+eval:
+  val_split: 0.15               # 15% of volumes held out for validation

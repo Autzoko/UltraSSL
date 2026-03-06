@@ -2,7 +2,9 @@
 
 Domain-adaptive DINOv2 self-supervised pretraining for breast ultrasound images.
 
-UltraSSL continues self-supervised training from official DINOv2 pretrained weights on unlabeled breast ultrasound data, producing a ViT encoder with strong dense patch-level features for a downstream lesion-presence classifier that reduces false positives.
+UltraSSL continues self-supervised training from official DINOv2 pretrained weights on unlabeled breast ultrasound data, producing a ViT encoder with strong dense patch-level features. The frozen encoder feeds two downstream classification systems:
+1. **Patch-level lesion classifier** — per-slice has_lesion detection using MIL on patch tokens
+2. **Volume-level MIL classifiers** — whole-volume binary (has_lesion) and multi-class (Class2/3/4 subtyping) using CLS token embeddings with gated attention pooling
 
 ---
 
@@ -16,7 +18,7 @@ UltraSSL continues self-supervised training from official DINOv2 pretrained weig
 │  │ Stage 1: Data Preprocessing                                  │   │
 │  │                                                              │   │
 │  │  3D Ultrasound Volumes                                       │   │
-│  │  (BIrads, Class2, Class3, Class4, Abus, Duying)               │   │
+│  │  (BIrads, Class2, Class3, Class4, Abus, Duying)              │   │
 │  │         │                                                    │   │
 │  │         ▼                                                    │   │
 │  │  External preprocessing script                               │   │
@@ -59,7 +61,7 @@ UltraSSL continues self-supervised training from official DINOv2 pretrained weig
 │                          │                                          │
 │                          ▼                                          │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │ Stage 3: Downstream Lesion Classifier                        │   │
+│  │ Stage 3: Patch-Level Lesion Classifier                       │   │
 │  │                                                              │   │
 │  │  WebDataset shards (with labels)                             │   │
 │  │         │                                                    │   │
@@ -77,6 +79,31 @@ UltraSSL continues self-supervised training from official DINOv2 pretrained weig
 │  │                                                              │   │
 │  │  Output: best_model.pth (per-slice lesion predictions)       │   │
 │  └──────────────────────────────────────────────────────────────┘   │
+│                          │                                          │
+│                          ▼                                          │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ Stage 4: Volume-Level MIL Classifiers                        │   │
+│  │                                                              │   │
+│  │  Pre-extract DINO CLS tokens (extract_embeddings.py)         │   │
+│  │  ──▶ Cache: embedding_cache/<sample_id>.pt                   │   │
+│  │         │                                                    │   │
+│  │         ▼                                                    │   │
+│  │  Volume = stack of K CLS tokens (K, 768)                     │   │
+│  │         │                                                    │   │
+│  │         ▼                                                    │   │
+│  │  Gated Attention MIL Pool ──▶ volume embed (768)             │   │
+│  │         │                                                    │   │
+│  │         ▼                                                    │   │
+│  │  Projector (768→256) + Heads:                                │   │
+│  │  ┌────────────────┬──────────────────┬───────────────────┐   │   │
+│  │  │ Joint          │ Presence         │ Subtype           │   │   │
+│  │  │ binary (B,1)   │ binary (B,1)     │ class (B,3)       │   │   │
+│  │  │ + class (B,3)  │                  │ (positive only)   │   │   │
+│  │  │ Focal + CE     │ Focal            │ Weighted CE       │   │   │
+│  │  └────────────────┴──────────────────┴───────────────────┘   │   │
+│  │                                                              │   │
+│  │  Output: volume-level lesion detection + subtype prediction  │   │
+│  └──────────────────────────────────────────────────────────────┘   │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -91,12 +118,12 @@ UltraSSL trains on 6 breast ultrasound datasets totaling **1,756 volumes / ~632K
 
 | Dataset | Volumes | Slices | Positive | Rate | Resolution | Notes |
 |---------|---------|--------|----------|------|------------|-------|
-| BIrads  | 57      | 22,300 | 3,218    | 14.4%| 1017×500   | BI-RADS classified |
-| Class2  | 147     | 51,450 | 4,634    | 9.0% | 1017×500   | |
-| Class3  | 207     | 72,450 | 4,611    | 6.4% | 1017×500   | |
-| Class4  | 216     | 75,250 | 6,718    | 8.9% | 1017×500   | |
-| Abus    | 200     | 68,444 | 6,656    | 9.7% | 682×865    | 3D ABUS volumes |
-| Duying  | 929     | 341,830| 0        | 0.0% | 1017×500   | Negative controls |
+| BIrads  | 57      | 22,300 | 3,218    | 14.4%| 1017x500   | BI-RADS classified |
+| Class2  | 147     | 51,450 | 4,634    | 9.0% | 1017x500   | |
+| Class3  | 207     | 72,450 | 4,611    | 6.4% | 1017x500   | |
+| Class4  | 216     | 75,250 | 6,718    | 8.9% | 1017x500   | |
+| Abus    | 200     | 68,444 | 6,656    | 9.7% | 682x865    | 3D ABUS volumes |
+| Duying  | 929     | 341,830| 0        | 0.0% | 1017x500   | Negative controls |
 
 Overall: **4.0% positive** (25,837 slices with lesions). Duying provides a large negative control set (54% of all slices).
 
@@ -181,16 +208,16 @@ The backbone is a standard Vision Transformer from the DINOv2 codebase:
 | Property | Value |
 |----------|-------|
 | Architecture | ViT-Base |
-| Patch size | 14×14 pixels |
-| Input size | 224×224 pixels |
-| Patch grid | 16×16 = 256 tokens |
+| Patch size | 14x14 pixels |
+| Input size | 224x224 pixels |
+| Patch grid | 16x16 = 256 tokens |
 | Embedding dim | 768 |
 | Layers | 12 transformer blocks |
 | Heads | 12 attention heads |
 | Parameters | ~86M |
 | Pretrained init | `dinov2_vitb14` (official ImageNet weights from torch hub) |
 
-The input image (any resolution) is resized to 224×224 via `RandomResizedCrop` during training. The ViT splits this into a 16×16 grid of 14×14 patches, producing 256 patch tokens plus 1 CLS token, each of dimension 768.
+The input image (any resolution) is resized to 224x224 via `RandomResizedCrop` during training. The ViT splits this into a 16x16 grid of 14x14 patches, producing 256 patch tokens plus 1 CLS token, each of dimension 768.
 
 Grayscale ultrasound images are replicated to 3 channels (RGB) for compatibility with ImageNet-pretrained weights.
 
@@ -202,8 +229,8 @@ Grayscale ultrasound images are replicated to 3 channels (RGB) for compatibility
 Input image
     │
     ├──▶ Multi-crop augmentation
-    │       ├── 2 global crops (224×224, scale [0.4, 1.0])
-    │       └── 2 local crops  (98×98,   scale [0.25, 0.6])
+    │       ├── 2 global crops (224x224, scale [0.4, 1.0])
+    │       └── 2 local crops  (98x98,   scale [0.25, 0.6])
     │
     ├──▶ Student (ViT-B/14 + DINOHead)
     │       • Processes all crops (global + local)
@@ -248,20 +275,7 @@ Three loss functions are computed jointly each iteration:
 | Teacher temperature | 0.04 → 0.07 (10-epoch warmup) | Sharpens teacher output gradually |
 | Epochs | 50 | |
 | Batch size | 24 per GPU | |
-| Epoch length | 5000 iterations | ~600K slices / (24 × 4 GPUs) ≈ 6250, rounded |
-
-### Multi-GPU training
-
-UltraSSL uses PyTorch DistributedDataParallel (DDP) via `torchrun`. Each GPU gets a unique subset of WebDataset shards (via `wds.split_by_node`) and its own batch. Gradients are synchronized across GPUs automatically.
-
-```bash
-# 4 GPUs
-torchrun --standalone --nproc_per_node=4 train_ultrassl.py \
-    --config config/ultrassl_vitb14_3d_labeled.yaml
-
-# SLURM
-sbatch scripts/train_dino.sbatch
-```
+| Epoch length | 5000 iterations | ~600K slices / (24 x 4 GPUs) ~ 6250, rounded |
 
 ### Data sampling strategy
 
@@ -277,7 +291,7 @@ Each image passes through the following pipeline per crop:
 Original image (variable resolution, grayscale → 3ch RGB)
     │
     ▼
-RandomResizedCrop (224×224 global or 98×98 local)
+RandomResizedCrop (224x224 global or 98x98 local)
     │
     ▼
 RandomHorizontalFlip (p=0.5) + RandomVerticalFlip (p=0.3)
@@ -338,7 +352,7 @@ Input (B, 3, 224, 224)
 Frozen DINO teacher backbone
     │
     ▼
-Patch tokens (B, 256, 768)     ─── 256 = 16×16 patch grid
+Patch tokens (B, 256, 768)     ─── 256 = 16x16 patch grid
     │
     ▼
 MLP head: 768 → 256 (GELU, Dropout) → 1
@@ -355,9 +369,9 @@ Image logit (B, 1)             ─── slice-level lesion score
 
 ### Patch label assignment
 
-Bounding boxes from annotations are mapped to the 16×16 patch grid:
+Bounding boxes from annotations are mapped to the 16x16 patch grid:
 
-1. Scale bbox from original image space to 224×224: `sx = 224/img_width`
+1. Scale bbox from original image space to 224x224: `sx = 224/img_width`
 2. For each patch (r, c), compute center: `cx = (c+0.5)*14`, `cy = (r+0.5)*14`
 3. Patch is **positive** (label=1) if its center falls inside any scaled bbox
 4. Patches within `ignore_margin` pixels of a bbox border get label=-1 (excluded from loss)
@@ -372,21 +386,122 @@ loss = patch_loss_weight * BCE(patch_logits, patch_labels, pos_weight=10.0, igno
      + image_loss_weight * BCE(image_logit, has_lesion, pos_weight=10.0)
 ```
 
-- `pos_weight=10.0` compensates for 8.9% positive rate (~1/0.089 ≈ 11.2)
+- `pos_weight=10.0` compensates for 8.9% positive rate (~1/0.089 ~ 11.2)
 - Patches with label=-1 (ignore margin) are masked out of the patch loss
 
 ### Train/val split
 
-Volumes are split 85/15 for training/validation, **stratified by dataset** to ensure proportional representation:
+Volumes are split 85/15 for training/validation, **stratified by dataset** to ensure proportional representation. Split is by volume (not by slice) to prevent data leakage from adjacent slices of the same scan.
+
+---
+
+## Downstream: Volume-level MIL classifiers
+
+Stage 4 introduces three volume-level classifiers that operate on stacks of frozen DINO CLS token embeddings using Multiple Instance Learning (MIL) aggregation. Each volume is treated as a "bag" of slice embeddings.
+
+### Embedding extraction
+
+Before training volume classifiers, pre-extract DINO CLS tokens from all slices:
+
+```bash
+python extract_embeddings.py \
+    --config config/volume_classifier.yaml \
+    --output-dir ./embedding_cache \
+    --batch-size 128
+```
+
+This produces per-volume cache files:
+```
+embedding_cache/
+├── embeddings/
+│   ├── <sample_id_1>.pt    # {"cls_tokens": (N,768), "slice_indices": [...], "has_lesion": 0/1, "dataset": "..."}
+│   ├── <sample_id_2>.pt
+│   └── ...
+└── volume_index.json        # {sample_id: {dataset, has_lesion, n_slices, ...}}
+```
+
+### MIL architecture
+
+All three classifiers share the same `VolumeClassifier` module:
 
 ```
-BIrads: 49 train, 8 val
-Class3: 176 train, 31 val
-Class4: 183 train, 32 val
-ABUS:   170 train, 30 val
+Volume slices: K CLS tokens (K, 768)     ─── K = max_slices (32)
+    │
+    ├── Pad (if fewer slices) or subsample (if more)
+    │
+    ▼
+Gated Attention MIL Pool                   ─── or Top-K Pool
+    │   • Tanh attention path x Sigmoid gate path
+    │   • Softmax-weighted aggregation
+    │   • Attention mask for padded positions
+    │
+    ▼
+Volume embedding (768)
+    │
+    ▼
+Projector: Linear(768→256) + GELU + Dropout(0.25)
+    │
+    ▼
+Heads (configurable per classifier):
+    ├── Binary head: Linear(256→1)   ──▶ has_lesion logit
+    └── Multi-class head: Linear(256→3) ──▶ Class2/Class3/Class4 logits
 ```
 
-Split is by volume (not by slice) to prevent data leakage from adjacent slices of the same scan.
+### Three classifier variants
+
+| Classifier | Script | Binary head | Multi-class head | Training data |
+|------------|--------|-------------|------------------|---------------|
+| **Joint** | `joint_volume_classifier.py` | Yes | Yes | All 6 datasets |
+| **Presence** | `lesion_presence_classifier.py` | Yes | No | All 6 datasets |
+| **Subtype** | `lesion_subtype_classifier.py` | No | Yes | Class2/3/4 only (positive volumes) |
+
+### Loss functions
+
+**Binary (Focal Loss)**:
+```
+FocalLoss(alpha=0.25, gamma=2.0, pos_weight=3.0)
+```
+Down-weights easy examples, focuses on hard positives/negatives. All 6 datasets contribute to binary loss since all volumes have `has_lesion` labels.
+
+**Multi-class (Cross-Entropy)**:
+```
+CrossEntropyLoss(weight=auto_computed_class_weights)
+```
+Only volumes from Class2/Class3/Class4 contribute (BIrads/Abus/Duying get `class_idx=-1`, excluded via masking). Class weights are auto-computed from inverse class frequencies.
+
+**Joint loss**: `binary_weight * focal_loss + multiclass_weight * ce_loss` (default 1.0 + 0.5).
+
+### Inference modes
+
+**Lesion presence inference** — filter volumes for downstream processing:
+```bash
+python lesion_presence_classifier.py \
+    --config config/volume_classifier.yaml \
+    --inference --checkpoint outputs/volume_classifier/best_model.pth \
+    --output-json predictions/presence.json \
+    data.cache_dir=./embedding_cache
+```
+Output: `{sample_id: {has_lesion_prob, has_lesion_pred, top_slice_indices, dataset, n_slices}}`
+
+**Lesion subtype inference** — classify positive volumes:
+```bash
+python lesion_subtype_classifier.py \
+    --config config/volume_classifier.yaml \
+    --inference --checkpoint outputs/volume_classifier/best_subtype.pth \
+    --filter-json predictions/presence.json \
+    --output-json predictions/subtypes.json \
+    data.cache_dir=./embedding_cache
+```
+The `--filter-json` flag accepts presence classifier output, running subtype prediction only on volumes predicted as positive.
+
+### Train/val split
+
+Volume-level classifiers use a 85/15 train/val split, **stratified by dataset**. Split is volume-aware (no data leakage). The split index is broadcast across GPUs via gloo for consistency.
+
+### Multi-GPU support
+
+- **Cached embeddings mode**: standard NCCL DDP with `DistributedSampler`
+- **On-the-fly mode**: gloo backend, no DDP wrapper (each GPU trains independently — backbone is frozen, only ~200K MIL head parameters train)
 
 ---
 
@@ -395,46 +510,61 @@ Split is by volume (not by slice) to prevent data leakage from adjacent slices o
 ```
 UltraSSL/
 ├── config/
-│   ├── data_root.json                # 2D dataset path definitions
-│   ├── data_label_root_3d.json       # 3D labeled dataset paths (local Mac)
-│   ├── data_label_root_3d_hpc.json  # 3D labeled dataset paths (HPC /scratch)
-│   ├── ultrassl_vitb14.yaml          # SSL config for 2D datasets
+│   ├── data_root_2d.json                # 2D dataset path definitions
+│   ├── data_root_3d.json                # 3D dataset path definitions
+│   ├── data_label_root_3d.json          # 3D labeled dataset paths (local Mac)
+│   ├── data_label_root_3d_hpc.json      # 3D labeled dataset paths (HPC /scratch)
+│   ├── ultrassl_vitb14.yaml             # SSL config for 2D datasets
+│   ├── ultrassl_vitb14_2d.yaml          # SSL config (2D variant)
 │   ├── ultrassl_vitb14_3d_labeled.yaml  # SSL config for 632K 3D slices (multi-GPU)
-│   └── lesion_classifier.yaml        # Downstream classifier config
-├── dinov2/                           # Official DINOv2 repo (git submodule, unmodified)
+│   ├── lesion_classifier.yaml           # Patch-level classifier config
+│   └── volume_classifier.yaml           # Volume-level MIL classifier config
+├── dinov2/                              # Official DINOv2 repo (git submodule, unmodified)
 ├── ultrassl/
 │   ├── data/
-│   │   ├── create_shards.py          # Convert raw images → WebDataset tar shards
-│   │   ├── create_labeled_shards.py  # Convert labeled 3D slices → shards with annotations
-│   │   ├── wds_dataset.py            # WebDataset loader (unlabeled)
-│   │   ├── wds_labeled_dataset.py    # WebDataset loader (labeled, SSL + detection modes)
-│   │   ├── freq_augment.py           # FDA, spectral band randomization, spectral dropout
-│   │   ├── augmentations.py          # Multi-crop pipeline with ultrasound transforms
-│   │   └── dataset.py               # Multi-source dataset with volume-aware loading
+│   │   ├── create_shards.py             # Convert raw images → WebDataset tar shards
+│   │   ├── create_labeled_shards.py     # Convert labeled 3D slices → shards with annotations
+│   │   ├── wds_dataset.py               # WebDataset loader (unlabeled)
+│   │   ├── wds_labeled_dataset.py       # WebDataset loader (labeled, SSL + detection modes)
+│   │   ├── volume_dataset.py            # Volume-level dataset (cached + on-the-fly)
+│   │   ├── freq_augment.py              # FDA, spectral band randomization, spectral dropout
+│   │   ├── augmentations.py             # Multi-crop pipeline with ultrasound transforms
+│   │   └── dataset.py                   # Multi-source dataset with volume-aware loading
 │   ├── models/
-│   │   ├── backbone.py               # Swappable ViT backbone + weight loading
-│   │   ├── ssl_meta_arch.py          # Teacher-student architecture (no FSDP)
-│   │   └── patch_classifier.py       # Patch-level lesion classifier with MIL pooling
+│   │   ├── backbone.py                  # Swappable ViT backbone + weight loading
+│   │   ├── ssl_meta_arch.py             # Teacher-student architecture (no FSDP)
+│   │   ├── patch_classifier.py          # Patch-level lesion classifier with MIL pooling
+│   │   └── volume_mil.py               # Volume-level MIL classifier (gated attention / top-k)
 │   ├── train/
-│   │   └── trainer.py                # Training loop (single-GPU / DDP)
+│   │   └── trainer.py                   # Training loop (single-GPU / DDP)
 │   └── utils/
-│       └── diagnostics.py            # Loss logging + embedding/collapse diagnostics
+│       └── diagnostics.py               # Loss logging + embedding/collapse diagnostics
 ├── scripts/
-│   ├── train_dino.sbatch             # SLURM: multi-GPU DINOv2 training
-│   └── create_shards.sbatch          # SLURM: shard creation (no GPU)
-├── train_ultrassl.py                 # SSL training entry point
-├── train_lesion_classifier.py        # Downstream classifier entry point
-├── visualize.py                      # Attention maps, PCA, similarity visualization
-└── requirements_ultrassl.txt         # Dependencies
+│   ├── create_shards.sbatch             # SLURM: shard creation (no GPU)
+│   ├── train_dino.sbatch                # SLURM: multi-GPU DINOv2 training
+│   ├── train_classifier.sbatch          # SLURM: patch-level classifier training
+│   ├── extract_embeddings.sbatch        # SLURM: DINO CLS token extraction
+│   └── train_volume_classifiers.sbatch  # SLURM: volume-level classifier training
+├── train_ultrassl.py                    # SSL pretraining entry point
+├── train_lesion_classifier.py           # Patch-level classifier entry point
+├── extract_embeddings.py                # Embedding extraction entry point
+├── joint_volume_classifier.py           # Joint binary + multi-class classifier
+├── lesion_presence_classifier.py        # Binary has_lesion classifier + inference
+├── lesion_subtype_classifier.py         # Multi-class subtype classifier + inference
+├── visualize.py                         # Attention maps, PCA, similarity visualization
+└── requirements_ultrassl.txt            # Dependencies
 ```
 
 ---
 
-## Quick start
+## HPC environment setup (from scratch)
 
-### 1. Clone
+These instructions target a SLURM-based HPC cluster with NVIDIA GPUs (e.g., NYU Greene).
+
+### 1. Clone the repository
 
 ```bash
+cd /scratch/$USER/Projects
 git clone --recurse-submodules https://github.com/Autzoko/UltraSSL.git
 cd UltraSSL
 ```
@@ -442,55 +572,75 @@ cd UltraSSL
 ### 2. Create conda environment
 
 ```bash
-conda create -n ultrassl python=3.10 -y
-conda activate ultrassl
+# Create env in /scratch (faster I/O than $HOME)
+conda create --prefix /scratch/$USER/envs/ultrassl python=3.10 -y
+conda activate /scratch/$USER/envs/ultrassl
 
-# Install PyTorch (pick ONE line matching your hardware)
-# CUDA 11.8
+# Load CUDA module (check available versions with: module avail cuda)
+module load cuda/11.8.0
+
+# Install PyTorch matching CUDA version
 conda install pytorch torchvision pytorch-cuda=11.8 -c pytorch -c nvidia -y
-# CUDA 12.1
-conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia -y
-# CPU only (for data preprocessing / testing without GPU)
-conda install pytorch torchvision cpuonly -c pytorch -y
 
 # Install remaining dependencies
 pip install -r requirements_ultrassl.txt
 ```
 
-Verify:
+### 3. Verify installation
 
 ```bash
-python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
-python -c "from ultrassl.data.dataset import UltrasoundDataset; print('UltraSSL OK')"
+python -c "
+import torch
+print(f'PyTorch {torch.__version__}')
+print(f'CUDA available: {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'CUDA version: {torch.version.cuda}')
+    print(f'GPU: {torch.cuda.get_device_name(0)}')
+"
+
+python -c "from ultrassl.models.backbone import build_backbone; print('Backbone OK')"
+python -c "from ultrassl.models.volume_mil import VolumeClassifier; print('Volume MIL OK')"
+python -c "from ultrassl.data.volume_dataset import scan_volume_index; print('Volume dataset OK')"
+```
+
+### 4. Prepare data
+
+Ensure WebDataset shards are available at a `/scratch` path:
+
+```bash
+# If shards need to be created from raw data:
+python -m ultrassl.data.create_labeled_shards \
+    --config config/data_label_root_3d_hpc.json \
+    --output-dir /scratch/$USER/Data/Ultrasound/Shards \
+    --skip-boundary 3 --min-variance 100 --neg-stride 1
+
+# Or via SLURM:
+sbatch scripts/create_shards.sbatch
+```
+
+### 5. Update config paths
+
+Edit the YAML config files to point to your `/scratch` paths:
+
+```bash
+# In config/ultrassl_vitb14_3d_labeled.yaml:
+#   data.shard_dir: "/scratch/$USER/Data/Ultrasound/Shards"
+
+# In config/volume_classifier.yaml:
+#   backbone.checkpoint: "/scratch/$USER/Projects/UltraSSL/outputs/ultrassl_vitb14_3d_labeled/teacher_backbone_latest.pth"
+#   data.shard_dir: "/scratch/$USER/Data/Ultrasound/Shards"
 ```
 
 ---
 
 ## Running the full pipeline
 
-### Step 1: Configure dataset paths
-
-Edit `config/data_label_root_3d.json` (local) or `config/data_label_root_3d_hpc.json` (HPC):
-
-```json
-{
-  "data": [
-    { "name": "BIrads", "path": "/path/to/processed/BIrads" },
-    { "name": "Class2", "path": "/path/to/processed/Class2" },
-    { "name": "Class3", "path": "/path/to/processed/Class3" },
-    { "name": "Class4", "path": "/path/to/processed/Class4" },
-    { "name": "Abus",   "path": "/path/to/processed/Abus" },
-    { "name": "Duying", "path": "/path/to/processed/Duying" }
-  ]
-}
-```
-
-### Step 2: Create WebDataset shards
+### Step 1: Create WebDataset shards
 
 ```bash
 python -m ultrassl.data.create_labeled_shards \
     --config config/data_label_root_3d.json \
-    --output-dir wds/ \
+    --output-dir /scratch/$USER/Data/Ultrasound/Shards \
     --skip-boundary 3 \
     --min-variance 100 \
     --neg-stride 1
@@ -505,7 +655,7 @@ python -m ultrassl.data.create_labeled_shards \
 
 Output:
 ```
-wds/
+Shards/
 ├── BIrads/shard-000000.tar ... shard-NNNNNN.tar
 ├── Class2/shard-000000.tar ...
 ├── Class3/shard-000000.tar ...
@@ -515,17 +665,17 @@ wds/
 └── index.json
 ```
 
-### Step 3: Train DINOv2 (self-supervised)
+### Step 2: Train DINOv2 (self-supervised pretraining)
 
 ```bash
 # Single GPU (debug/testing)
 python train_ultrassl.py --config config/ultrassl_vitb14_3d_labeled.yaml \
-    data.shard_dir=/path/to/shards
+    data.shard_dir=/scratch/$USER/Data/Ultrasound/Shards
 
 # Multi-GPU (recommended, 4 GPUs)
 torchrun --standalone --nproc_per_node=4 train_ultrassl.py \
     --config config/ultrassl_vitb14_3d_labeled.yaml \
-    data.shard_dir=/path/to/shards
+    data.shard_dir=/scratch/$USER/Data/Ultrasound/Shards
 
 # SLURM (HPC)
 sbatch scripts/train_dino.sbatch
@@ -551,12 +701,12 @@ Output in `outputs/ultrassl_vitb14_3d_labeled/`:
 
 Resume automatically by re-running the same command. Use `--no-resume` to start fresh.
 
-### Step 4: Visualize features (optional)
+### Step 3: Visualize features (optional)
 
 ```bash
 python visualize.py \
     --backbone outputs/ultrassl_vitb14_3d_labeled/teacher_backbone_latest.pth \
-    --shard wds/BIrads/shard-000000.tar \
+    --shard Shards/BIrads/shard-000000.tar \
     --n-images 16 \
     --output-dir vis_output/
 ```
@@ -566,19 +716,18 @@ What to look for:
 - Similarity maps should show spatial variation (not uniform red = collapse)
 - PCA features should reveal tissue boundaries and structures
 
-### Step 5: Train lesion classifier
+### Step 4: Train patch-level lesion classifier
 
 ```bash
+# Single GPU
 python train_lesion_classifier.py --config config/lesion_classifier.yaml
-```
 
-Override config values:
+# Multi-GPU
+torchrun --standalone --nproc_per_node=4 train_lesion_classifier.py \
+    --config config/lesion_classifier.yaml
 
-```bash
-python train_lesion_classifier.py --config config/lesion_classifier.yaml \
-    optim.epochs=50 \
-    classifier.mil_type=attention \
-    loss.pos_weight=8.0
+# SLURM
+sbatch scripts/train_classifier.sbatch
 ```
 
 Output in `outputs/lesion_classifier/`:
@@ -589,26 +738,80 @@ Output in `outputs/lesion_classifier/`:
 | `checkpoint_epoch*.pth` | Periodic checkpoints |
 | `training_metrics.jsonl` | Per-epoch loss and evaluation metrics |
 
----
+### Step 5: Extract DINO CLS embeddings (one-time)
 
-## Alternative: 2D unlabeled data
-
-For training on raw 2D image directories without labels:
+Pre-extract frozen backbone CLS tokens for fast volume classifier training:
 
 ```bash
-# Edit config/data_root.json with dataset paths, then:
+# Single GPU (recommended — extraction is I/O bound)
+python extract_embeddings.py \
+    --config config/volume_classifier.yaml \
+    --output-dir /scratch/$USER/Data/Ultrasound/embedding_cache \
+    --batch-size 128
 
-# From raw files
-python train_ultrassl.py --config config/ultrassl_vitb14.yaml
+# SLURM
+sbatch scripts/extract_embeddings.sbatch
+```
 
-# Or pack into shards first
-python -m ultrassl.data.create_shards \
-    --data-root config/data_root.json \
-    --output-dir shards/ \
-    --images-per-shard 1000
+### Step 6: Train volume-level classifiers
 
-python train_ultrassl.py --config config/ultrassl_vitb14.yaml \
-    data.shard_dir=shards/
+All three classifiers share the same config and cache directory. Choose which to train:
+
+```bash
+CACHE=/scratch/$USER/Data/Ultrasound/embedding_cache
+
+# Joint classifier (binary + multi-class)
+torchrun --standalone --nproc_per_node=4 joint_volume_classifier.py \
+    --config config/volume_classifier.yaml \
+    data.cache_dir=$CACHE
+
+# Lesion presence classifier (binary only)
+torchrun --standalone --nproc_per_node=4 lesion_presence_classifier.py \
+    --config config/volume_classifier.yaml \
+    data.cache_dir=$CACHE
+
+# Lesion subtype classifier (multi-class, positive volumes only)
+torchrun --standalone --nproc_per_node=4 lesion_subtype_classifier.py \
+    --config config/volume_classifier.yaml \
+    data.cache_dir=$CACHE
+
+# SLURM (default: joint)
+sbatch scripts/train_volume_classifiers.sbatch
+
+# SLURM (specific script)
+sbatch --export=SCRIPT=lesion_presence_classifier.py scripts/train_volume_classifiers.sbatch
+sbatch --export=SCRIPT=lesion_subtype_classifier.py scripts/train_volume_classifiers.sbatch
+```
+
+Output in `outputs/volume_classifier/`:
+
+| File | Description |
+|---|---|
+| `best_model.pth` | Best model by validation AUROC (binary) or macro F1 (multi-class) |
+| `checkpoint_epoch*.pth` | Periodic checkpoints every 5 epochs |
+| `training_log.jsonl` | Per-epoch loss and metrics |
+
+### Step 7: Run inference pipeline
+
+The inference pipeline chains presence detection → subtype classification:
+
+```bash
+# 1. Predict which volumes contain lesions
+python lesion_presence_classifier.py \
+    --config config/volume_classifier.yaml \
+    --inference \
+    --checkpoint outputs/volume_classifier/best_presence.pth \
+    --output-json predictions/presence.json \
+    data.cache_dir=$CACHE
+
+# 2. Classify positive volumes into subtypes
+python lesion_subtype_classifier.py \
+    --config config/volume_classifier.yaml \
+    --inference \
+    --checkpoint outputs/volume_classifier/best_subtype.pth \
+    --filter-json predictions/presence.json \
+    --output-json predictions/subtypes.json \
+    data.cache_dir=$CACHE
 ```
 
 ---

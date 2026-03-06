@@ -25,7 +25,7 @@ _dinov2_root = _project_root / "dinov2"
 if str(_dinov2_root) not in sys.path:
     sys.path.insert(0, str(_dinov2_root))
 
-os.environ.setdefault("XFORMERS_DISABLED", "1")
+# os.environ.setdefault("XFORMERS_DISABLED", "1")  # set via SLURM script or CLI if needed
 
 from dinov2.data.collate import collate_data_and_cast
 from dinov2.data.masking import MaskingGenerator

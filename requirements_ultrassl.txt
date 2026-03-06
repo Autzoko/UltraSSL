@@ -17,5 +17,8 @@ Pillow>=9.0.0
 # WebDataset (for shard-based loading on HPC)
 webdataset>=0.2.86
 
+# Metrics (AUROC for classifier evaluation)
+scikit-learn>=1.0.0
+
 # Visualization
 matplotlib>=3.5.0
