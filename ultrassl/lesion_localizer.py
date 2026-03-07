@@ -142,8 +142,10 @@ class CenterNetFocalLoss(nn.Module):
         Returns:
             Scalar loss.
         """
-        pred = torch.sigmoid(pred_logits)
+        # Force float32 — in AMP float16, 1-1e-6 rounds to 1.0 → log(0) = -inf
+        pred = torch.sigmoid(pred_logits.float())
         pred = pred.clamp(1e-6, 1 - 1e-6)
+        target = target.float()
 
         pos_mask = target.eq(1).float()
         neg_mask = target.lt(1).float()

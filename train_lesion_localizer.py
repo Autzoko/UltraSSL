@@ -1,5 +1,9 @@
 """
-Train lesion center heatmap localizer with multi-GPU DDP + AMP.
+Train lesion center heatmap localizer with multi-GPU + AMP.
+
+No DDP — backbone is frozen and the conv decoder head is small (~1.4M params).
+Each GPU trains independently on its own WebDataset shard subset.
+Validation metrics are gathered across ranks via gloo.
 
 Predicts Gaussian center heatmaps from coronal ultrasound slices using
 frozen DINO ViT-B/14 patch tokens + lightweight conv decoder.
@@ -35,11 +39,12 @@ import os
 import sys
 from pathlib import Path
 
+import random
+
 import numpy as np
 import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Ensure project root and dinov2 are importable
 _project_root = Path(__file__).resolve().parent
@@ -68,12 +73,17 @@ logger = logging.getLogger("lesion_localizer")
 
 
 def setup_distributed():
-    """Initialize DDP if launched via torchrun, else single-GPU."""
+    """Initialize process group for multi-GPU (gloo backend, no NCCL).
+
+    We use gloo for lightweight communication (volume split broadcast,
+    val metric gathering) but NO DDP gradient sync — each GPU trains
+    independently on its own data shard.
+    """
     if "RANK" in os.environ:
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        dist.init_process_group("nccl")
+        dist.init_process_group(backend="gloo")
         torch.cuda.set_device(local_rank)
         return rank, local_rank, world_size
     return 0, 0, 1
@@ -130,11 +140,11 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, criterion,
         optimizer.zero_grad()
         scaler.scale(loss).backward()
 
-        # Gradient clipping
+        # Gradient clipping (only trainable params — no DDP wrapper)
         if cfg.optim.get("max_grad_norm", 0) > 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
-                model.parameters(), cfg.optim.max_grad_norm
+                model.get_trainable_params(), cfg.optim.max_grad_norm
             )
 
         scaler.step(optimizer)
@@ -265,11 +275,10 @@ def evaluate(model, loader, device, cfg):
 
 def save_checkpoint(model, optimizer, scheduler, epoch, metrics, path):
     """Save head checkpoint (backbone is frozen, not saved)."""
-    state = model.module if hasattr(model, "module") else model
     torch.save(
         {
             "epoch": epoch,
-            "head_state_dict": state.head.state_dict(),
+            "head_state_dict": model.head.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "metrics": metrics,
@@ -424,10 +433,11 @@ def main():
         logger.info(f"Mode: {'inference' if args.inference else 'training'}")
         logger.info(f"World size: {world_size}, Device: {device}")
 
-    # ── Seed ──────────────────────────────────────────────────────────────
+    # ── Seed (per-rank for data diversity) ─────────────────────────────────
     seed = cfg.train.seed
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    torch.manual_seed(seed + rank)
+    np.random.seed(seed + rank)
+    random.seed(seed + rank)
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = LesionLocalizer(
@@ -454,11 +464,6 @@ def main():
         run_inference(model, cfg, device, datasets, output_path)
         cleanup_distributed()
         return
-
-    # ── DDP ───────────────────────────────────────────────────────────────
-    if distributed:
-        model = DDP(model, device_ids=[local_rank],
-                    find_unused_parameters=False)
 
     # ── Data: volume-aware train/val split ──────────────────────────────
     heatmap_size = cfg.head.get("heatmap_size", 64)
@@ -522,9 +527,8 @@ def main():
         beta=cfg.loss.get("beta", 4.0),
     )
 
-    # ── Optimizer ─────────────────────────────────────────────────────────
-    raw_model = model.module if hasattr(model, "module") else model
-    trainable_params = raw_model.get_trainable_params()
+    # ── Optimizer (no DDP — each GPU trains independently) ──────────────
+    trainable_params = model.get_trainable_params()
 
     n_trainable = sum(p.numel() for p in trainable_params) / 1e6
     if is_main_process():
@@ -606,6 +610,10 @@ def main():
                     model, optimizer, scheduler, epoch,
                     val_metrics, output_dir / f"checkpoint_epoch{epoch}.pth",
                 )
+
+        # Lightweight sync between epochs
+        if distributed:
+            dist.barrier()
 
     # ── Done ──────────────────────────────────────────────────────────────
     if is_main_process():
