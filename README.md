@@ -2,9 +2,10 @@
 
 Domain-adaptive DINOv2 self-supervised pretraining for breast ultrasound images.
 
-UltraSSL continues self-supervised training from official DINOv2 pretrained weights on unlabeled breast ultrasound data, producing a ViT encoder with strong dense patch-level features. The frozen encoder feeds two downstream classification systems:
+UltraSSL continues self-supervised training from official DINOv2 pretrained weights on unlabeled breast ultrasound data, producing a ViT encoder with strong dense patch-level features. The frozen encoder feeds three downstream systems:
 1. **Patch-level lesion classifier** — per-slice has_lesion detection using MIL on patch tokens
 2. **Volume-level MIL classifiers** — whole-volume binary (has_lesion) and multi-class (Class2/3/4 subtyping) using CLS token embeddings with gated attention pooling
+3. **Lesion center heatmap localizer** — predicts Gaussian center heatmaps from patch tokens for AutoSAMUS point prompt generation
 
 ---
 
@@ -103,6 +104,32 @@ UltraSSL continues self-supervised training from official DINOv2 pretrained weig
 │  │  └────────────────┴──────────────────┴───────────────────┘   │   │
 │  │                                                              │   │
 │  │  Output: volume-level lesion detection + subtype prediction  │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                          │                                          │
+│                          ▼                                          │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ Stage 5: Lesion Center Heatmap Localizer                    │   │
+│  │                                                              │   │
+│  │  WebDataset shards (with bbox annotations)                   │   │
+│  │         │                                                    │   │
+│  │         ▼                                                    │   │
+│  │  Frozen DINO backbone ──▶ patch tokens (B, 256, 768)         │   │
+│  │         │                                                    │   │
+│  │         ▼                                                    │   │
+│  │  Reshape to spatial grid (B, 768, 16, 16)                    │   │
+│  │         │                                                    │   │
+│  │         ▼                                                    │   │
+│  │  LocalizationHead (~1.4M params)                             │   │
+│  │  Conv decoder: 16×16 → 32×32 → 64×64                        │   │
+│  │         │                                                    │   │
+│  │         ▼                                                    │   │
+│  │  CenterNet Focal Loss vs Gaussian GT heatmap                 │   │
+│  │         │                                                    │   │
+│  │         ▼                                                    │   │
+│  │  NMS peak detection ──▶ center points (x, y, confidence)     │   │
+│  │         │                                                    │   │
+│  │         ▼                                                    │   │
+│  │  Output: JSON center points → AutoSAMUS point prompts        │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -505,6 +532,111 @@ Volume-level classifiers use a 85/15 train/val split, **stratified by dataset**.
 
 ---
 
+## Downstream: Lesion center heatmap localizer
+
+Stage 5 trains a lightweight conv decoder on frozen DINO patch tokens to predict Gaussian center heatmaps. Detected center points serve as point prompts for AutoSAMUS segmentation.
+
+### Architecture
+
+```
+Input (B, 3, 224, 224)
+    │
+    ▼
+Frozen DINO teacher backbone
+    │
+    ▼
+Patch tokens (B, 256, 768)     ─── 256 = 16x16 patch grid
+    │
+    ▼
+Reshape to spatial (B, 768, 16, 16)
+    │
+    ▼
+LocalizationHead (~1.4M trainable params):
+    Conv2d(768→256, 1×1) + BN + ReLU        16×16
+    Conv2d(256→256, 3×3, pad=1) + BN + ReLU 16×16
+    ConvTranspose2d(256→128, 4, s=2, p=1)   32×32 + BN + ReLU
+    ConvTranspose2d(128→64, 4, s=2, p=1)    64×64 + BN + ReLU
+    Conv2d(64→1, 1×1)                       64×64 logits
+    │
+    ▼
+Heatmap (B, 1, 64, 64)         ─── sigmoid → [0,1]
+```
+
+Final conv bias is initialized to `log(1/99) ≈ -2.19` so initial predictions are near zero (CenterNet convention for sparse targets).
+
+### Gaussian heatmap targets
+
+Ground-truth heatmaps are generated from `bboxes_normalized` annotations:
+
+1. For each bbox: center = `((nx1+nx2)/2 * H, (ny1+ny2)/2 * H)` where H=64
+2. Sigma = `max(min(bbox_w, bbox_h) / 6, 1.5)` in heatmap pixels
+3. Gaussian rendered within 3-sigma radius
+4. Overlapping bboxes use element-wise max (no additive blending)
+5. Negative slices (no bboxes) → all-zero heatmap
+
+### Loss: CenterNet focal loss
+
+Modified focal loss for continuous Gaussian targets (alpha=2.0, beta=4.0):
+
+| Pixel type | Loss term |
+|---|---|
+| **Center** (target=1) | `-(1-p)^α · log(p)` |
+| **Near-center** (0<target<1) | `-(1-target)^β · p^α · log(1-p)` |
+| **Background** (target=0) | `-p^α · log(1-p)` |
+
+Loss is normalized by N = number of center points in the batch (not positive pixels).
+
+### Data pipeline
+
+WebDataset streaming with balanced sampling:
+
+- **Positive enrichment**: `oversample_positive=3.0` → keep 1/3 of negatives, achieving ~1:3 pos:neg ratio
+- **Dataset balance**: smaller datasets' shard lists are replicated to match largest
+- **Excludes Duying** (0% positive rate — no lesion annotations)
+- Resize to 224×224 + ImageNet normalization
+
+### Evaluation metrics
+
+| Metric | Description |
+|---|---|
+| `center_hit_rate` | Fraction of positive slices where top-1 peak falls inside any GT bbox |
+| `top_k_recall` | Fraction of GT bboxes with at least one peak inside them |
+| `mean_center_distance` | Mean L2 from predicted peak to nearest GT center (normalized coords) |
+| `false_positive_rate` | Fraction of negative slices with any detection |
+
+Best model saved by `center_hit_rate`.
+
+### Peak detection
+
+NMS via `F.max_pool2d` comparison (CenterNet standard):
+
+1. Apply sigmoid to logits
+2. Run max-pool with kernel=3 on heatmap
+3. Keep pixels that are local maxima and above threshold (default 0.3)
+4. Return top-k peaks sorted by confidence, with normalized (x, y) coords
+
+### Inference output
+
+Inference mode exports JSON for direct AutoSAMUS prompt generation:
+
+```json
+[
+  {
+    "sample_id": "106_1612",
+    "slice_idx": 119,
+    "dataset": "BIrads",
+    "has_lesion": 1,
+    "centers": [
+      {"x": 0.52, "y": 0.73, "confidence": 0.91, "x_pixel": 529, "y_pixel": 365},
+      {"x": 0.31, "y": 0.45, "confidence": 0.67, "x_pixel": 315, "y_pixel": 225}
+    ],
+    "gt_bboxes": [[0.487, 0.71, 0.551, 0.796]]
+  }
+]
+```
+
+---
+
 ## Project structure
 
 ```
@@ -518,7 +650,8 @@ UltraSSL/
 │   ├── ultrassl_vitb14_2d.yaml          # SSL config (2D variant)
 │   ├── ultrassl_vitb14_3d_labeled.yaml  # SSL config for 632K 3D slices (multi-GPU)
 │   ├── lesion_classifier.yaml           # Patch-level classifier config
-│   └── volume_classifier.yaml           # Volume-level MIL classifier config
+│   ├── volume_classifier.yaml           # Volume-level MIL classifier config
+│   └── lesion_localizer.yaml            # Lesion center heatmap localizer config
 ├── dinov2/                              # Official DINOv2 repo (git submodule, unmodified)
 ├── ultrassl/
 │   ├── data/
@@ -537,6 +670,8 @@ UltraSSL/
 │   │   └── volume_mil.py               # Volume-level MIL classifier (gated attention / top-k)
 │   ├── train/
 │   │   └── trainer.py                   # Training loop (single-GPU / DDP)
+│   ├── lesion_localizer.py              # Lesion center heatmap localizer + data pipeline
+│   ├── mil_classifier.py               # Volume-level MIL classifier components
 │   └── utils/
 │       └── diagnostics.py               # Loss logging + embedding/collapse diagnostics
 ├── scripts/
@@ -547,6 +682,8 @@ UltraSSL/
 │   └── train_volume_classifiers.sbatch  # SLURM: volume-level classifier training
 ├── train_ultrassl.py                    # SSL pretraining entry point
 ├── train_lesion_classifier.py           # Patch-level classifier entry point
+├── train_mil_classifier.py              # Volume-level MIL classifier entry point
+├── train_lesion_localizer.py            # Lesion center heatmap localizer entry point
 ├── extract_embeddings.py                # Embedding extraction entry point
 ├── joint_volume_classifier.py           # Joint binary + multi-class classifier
 ├── lesion_presence_classifier.py        # Binary has_lesion classifier + inference
@@ -813,6 +950,47 @@ python lesion_subtype_classifier.py \
     --output-json predictions/subtypes.json \
     data.cache_dir=$CACHE
 ```
+
+### Step 8: Train lesion center heatmap localizer
+
+```bash
+# Multi-GPU (recommended)
+torchrun --standalone --nproc_per_node=4 train_lesion_localizer.py \
+    --config config/lesion_localizer.yaml
+
+# Single GPU
+python train_lesion_localizer.py --config config/lesion_localizer.yaml
+
+# Override config values
+torchrun --standalone --nproc_per_node=4 train_lesion_localizer.py \
+    --config config/lesion_localizer.yaml \
+    optim.lr=5e-4 optim.epochs=60 data.oversample_positive=5.0
+
+# Specify datasets explicitly
+torchrun --standalone --nproc_per_node=4 train_lesion_localizer.py \
+    --config config/lesion_localizer.yaml \
+    --datasets BIrads Class3 Class4 ABUS
+```
+
+Output in `outputs/lesion_localizer/`:
+
+| File | Description |
+|---|---|
+| `best_model.pth` | Best model by validation center_hit_rate |
+| `checkpoint_epoch*.pth` | Periodic checkpoints every 5 epochs |
+| `training_log.jsonl` | Per-epoch loss and localization metrics |
+
+### Step 9: Run localizer inference (export center points for AutoSAMUS)
+
+```bash
+python train_lesion_localizer.py \
+    --config config/lesion_localizer.yaml \
+    --inference \
+    --checkpoint outputs/lesion_localizer/best_model.pth \
+    --datasets BIrads Class3 Class4 ABUS
+```
+
+Output: `outputs/lesion_localizer/inference_results.json` — list of per-slice center point candidates with normalized and pixel coordinates, ready for AutoSAMUS point prompt generation.
 
 ---
 

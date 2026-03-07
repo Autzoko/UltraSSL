@@ -1,0 +1,69 @@
+# Lesion center heatmap localizer
+#
+# Predicts Gaussian center heatmaps from ultrasound slices using frozen
+# DINO ViT-B/14 patch tokens + lightweight conv decoder.
+#
+# Usage:
+#   # Multi-GPU training
+#   torchrun --nproc_per_node=4 train_lesion_localizer.py \
+#       --config config/lesion_localizer.yaml
+#
+#   # Inference (export center points as JSON for AutoSAMUS)
+#   python train_lesion_localizer.py \
+#       --config config/lesion_localizer.yaml \
+#       --inference --checkpoint outputs/lesion_localizer/best_model.pth \
+#       --datasets BIrads Class3 Class4 ABUS
+
+# --- Backbone (frozen) ---
+backbone:
+  checkpoint: "/scratch/ll5582/Projects/UltraSSL/outputs/ultrassl_vitb14_3d_labeled/teacher_backbone_latest.pth"
+  arch: vit_base
+  patch_size: 14
+  img_size: 224
+
+# --- Localization head ---
+head:
+  heatmap_size: 64              # output heatmap resolution (64×64)
+  min_sigma: 1.5                # minimum Gaussian sigma in heatmap pixels
+  unfreeze_last_n: 0            # backbone blocks to unfreeze (0 = fully frozen)
+
+# --- Data ---
+data:
+  shard_dir: "/scratch/ll5582/Data/Ultrasound/Shards"
+  datasets:                     # null = all datasets with shards
+    - BIrads
+    - Class3
+    - Class4
+    - ABUS
+  batch_size: 24                # per GPU
+  num_workers: 8
+  shuffle_buffer: 5000
+  epoch_length: 1000            # training batches per epoch
+  val_epoch_length: 200         # validation batches per epoch
+  oversample_positive: 3.0      # keep 1/3 negatives → ~1:3 pos:neg ratio
+
+# --- Loss (CenterNet focal loss) ---
+loss:
+  alpha: 2.0                    # focusing parameter for hard examples
+  beta: 4.0                     # down-weighting for Gaussian tail pixels
+
+# --- Optimizer ---
+optim:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 50
+  warmup_epochs: 3
+  max_grad_norm: 1.0            # gradient clipping (0 = disabled)
+
+# --- Training ---
+train:
+  output_dir: ./outputs/lesion_localizer
+  seed: 42
+  log_every: 20
+  use_amp: true
+
+# --- Evaluation ---
+eval:
+  threshold: 0.3                # minimum peak confidence
+  nms_kernel: 3                 # NMS kernel size for peak detection
+  max_detections: 5             # max peaks per slice
