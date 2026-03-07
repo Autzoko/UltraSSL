@@ -55,6 +55,8 @@ from ultrassl.lesion_localizer import (
     build_heatmap_wds_pipeline,
     compute_localization_metrics,
     detect_peaks,
+    scan_volume_ids,
+    volume_train_val_split,
 )
 
 logger = logging.getLogger("lesion_localizer")
@@ -458,9 +460,25 @@ def main():
         model = DDP(model, device_ids=[local_rank],
                     find_unused_parameters=False)
 
-    # ── Data ──────────────────────────────────────────────────────────────
+    # ── Data: volume-aware train/val split ──────────────────────────────
     heatmap_size = cfg.head.get("heatmap_size", 64)
     min_sigma = cfg.head.get("min_sigma", 1.5)
+    val_ratio = cfg.eval.get("val_split", 0.15)
+
+    if is_main_process():
+        logger.info("Scanning shard metadata for volume-aware split ...")
+
+    # All ranks scan independently (deterministic, avoids broadcast)
+    volume_info = scan_volume_ids(cfg.data.shard_dir, datasets)
+    train_vol_ids, val_vol_ids = volume_train_val_split(
+        volume_info, val_ratio=val_ratio, seed=seed
+    )
+
+    if is_main_process():
+        logger.info(
+            f"Volume split: {len(train_vol_ids)} train, "
+            f"{len(val_vol_ids)} val volumes"
+        )
 
     if is_main_process():
         logger.info("Building training data pipeline ...")
@@ -477,6 +495,7 @@ def main():
         oversample_positive=cfg.data.get("oversample_positive", 3.0),
         balance_datasets=True,
         min_sigma=min_sigma,
+        volume_ids=train_vol_ids,
     )
 
     if is_main_process():
@@ -494,6 +513,7 @@ def main():
         oversample_positive=0.0,  # no oversampling for validation
         balance_datasets=False,
         min_sigma=min_sigma,
+        volume_ids=val_vol_ids,
     )
 
     # ── Loss ──────────────────────────────────────────────────────────────

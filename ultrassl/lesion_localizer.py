@@ -22,6 +22,8 @@ import logging
 import math
 import os
 import random
+import tarfile
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -483,6 +485,97 @@ def compute_localization_metrics(
 
 
 # ============================================================================
+# Volume-aware train/val split
+# ============================================================================
+
+
+def scan_volume_ids(shard_dir: str, datasets: list = None) -> dict:
+    """Scan shard JSONs and collect unique volume IDs with metadata.
+
+    Args:
+        shard_dir: Root directory containing <dataset_name>/shard-*.tar.
+        datasets: Dataset names to include (None = all).
+
+    Returns:
+        dict: {sample_id: {"dataset": str, "has_lesion": int, "n_slices": int}}
+    """
+    volumes = {}
+    for entry in sorted(os.listdir(shard_dir)):
+        subdir = os.path.join(shard_dir, entry)
+        if not os.path.isdir(subdir):
+            continue
+        if datasets is not None and entry not in datasets:
+            continue
+        shard_files = sorted(glob.glob(os.path.join(subdir, "shard-*.tar")))
+        if not shard_files:
+            continue
+        logger.info(f"  Scanning {entry}: {len(shard_files)} shards ...")
+
+        for shard_path in shard_files:
+            with tarfile.open(shard_path, "r") as tar:
+                for member in tar.getmembers():
+                    if not member.name.endswith(".json"):
+                        continue
+                    f = tar.extractfile(member)
+                    if f is None:
+                        continue
+                    meta = json.loads(f.read().decode("utf-8"))
+                    sid = meta["sample_id"]
+
+                    if sid not in volumes:
+                        volumes[sid] = {
+                            "dataset": meta.get("dataset", entry),
+                            "has_lesion": 0,
+                            "n_slices": 0,
+                        }
+
+                    volumes[sid]["has_lesion"] = max(
+                        volumes[sid]["has_lesion"], int(meta.get("has_lesion", 0))
+                    )
+                    volumes[sid]["n_slices"] += 1
+
+    for ds in (datasets or sorted(set(v["dataset"] for v in volumes.values()))):
+        ds_vols = [v for v in volumes.values() if v["dataset"] == ds]
+        n_pos = sum(v["has_lesion"] for v in ds_vols)
+        logger.info(
+            f"  {ds}: {len(ds_vols)} volumes "
+            f"({n_pos} positive, {len(ds_vols) - n_pos} negative)"
+        )
+    logger.info(f"Total: {len(volumes)} volumes")
+    return volumes
+
+
+def volume_train_val_split(volume_info: dict, val_ratio: float = 0.15, seed: int = 42):
+    """Stratified train/val split by dataset.
+
+    Deterministic seeding ensures all DDP ranks get the same split.
+
+    Args:
+        volume_info: Output of scan_volume_ids().
+        val_ratio: Fraction of volumes to hold out for validation.
+        seed: Random seed for reproducibility.
+
+    Returns:
+        (train_ids, val_ids) — sets of sample_id strings.
+    """
+    rng = random.Random(seed)
+    by_dataset = defaultdict(list)
+    for vid, info in volume_info.items():
+        by_dataset[info["dataset"]].append(vid)
+
+    train_ids, val_ids = [], []
+    for ds_name in sorted(by_dataset.keys()):
+        vids = sorted(by_dataset[ds_name])
+        rng.shuffle(vids)
+        n_val = max(1, int(len(vids) * val_ratio))
+        val_ids.extend(vids[:n_val])
+        train_ids.extend(vids[n_val:])
+        logger.info(f"  Split {ds_name}: {len(vids) - n_val} train, {n_val} val")
+
+    return set(train_ids), set(val_ids)
+
+
+# ============================================================================
 # WebDataset pipeline for heatmap training
 # ============================================================================
 
@@ -530,6 +623,7 @@ def build_heatmap_wds_pipeline(
     oversample_positive: float = 3.0,
     balance_datasets: bool = True,
     min_sigma: float = 1.5,
+    volume_ids: set = None,
 ):
     """Build a WebDataset pipeline for heatmap localization training.
 
@@ -545,6 +639,8 @@ def build_heatmap_wds_pipeline(
         oversample_positive: Positive enrichment factor (e.g. 3.0 → keep 1/3 negatives).
         balance_datasets: Replicate smaller datasets to match largest.
         min_sigma: Minimum Gaussian sigma in heatmap pixels.
+        volume_ids: If provided, only include slices whose sample_id is in this set.
+            Used for volume-aware train/val splitting.
 
     Returns:
         (dataset, loader) tuple.
@@ -604,6 +700,21 @@ def build_heatmap_wds_pipeline(
         .shuffle(shuffle_buffer)
         .decode("pil")
     )
+
+    # Volume-aware filtering: only keep slices belonging to allowed volumes
+    if volume_ids is not None:
+        _vol_ids = volume_ids  # capture in closure
+
+        def volume_filter(sample):
+            ann = sample.get("json", b"{}")
+            if isinstance(ann, bytes):
+                ann = json.loads(ann.decode())
+            elif isinstance(ann, str):
+                ann = json.loads(ann)
+            return ann.get("sample_id", "") in _vol_ids
+
+        pipeline = pipeline.select(volume_filter)
+        logger.info(f"Heatmap WDS: filtering to {len(volume_ids)} volumes")
 
     # Balanced sampling: keep all positives, subsample negatives
     if oversample_positive > 1.0:

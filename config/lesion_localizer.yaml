@@ -64,6 +64,7 @@ train:
 
 # --- Evaluation ---
 eval:
+  val_split: 0.15               # 15% of volumes held out for validation
   threshold: 0.3                # minimum peak confidence
   nms_kernel: 3                 # NMS kernel size for peak detection
   max_detections: 5             # max peaks per slice
