@@ -69,7 +69,7 @@ optim:
 
 # --- Training ---
 train:
-  batch_size_per_gpu: 24            # 4 GPUs × 24 = 96 effective batch
+  batch_size_per_gpu: 24            # 8 GPUs × 24 = 192 effective batch
   num_workers: 8
   output_dir: ./outputs/ultrassl_vitb14_3d_labeled
   OFFICIAL_EPOCH_LENGTH: 5000       # ~600K slices / (24*4 GPUs) ≈ 6250, round down
@@ -120,6 +120,7 @@ data:
   mode: "ssl"                        # labeled shards, SSL mode (ignore annotations)
   balance_datasets: true             # replicate smaller datasets for equal sampling
   pos_enrichment: 0.0                # 0 = use ALL slices (no negative subsampling for SSL)
+  shuffle_buffer: 10000              # sample-level shuffle buffer (larger = better cross-volume mixing)
   volume_slice_stride: 1             # shards already subsampled during creation
   min_slice_entropy: 0.0
   image_extensions:

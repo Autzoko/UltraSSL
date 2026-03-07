@@ -4,10 +4,10 @@
 #SBATCH --error=logs/dino_%j.err
 #SBATCH --partition=nvidia
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4
+#SBATCH --ntasks-per-node=8
+#SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=256G
+#SBATCH --mem=512G
 #SBATCH --time=72:00:00
 
 # =============================================================================
@@ -24,6 +24,13 @@
 #   2. DINOv2 ViT-B/14 checkpoint (auto-downloaded from torch hub on first run)
 #
 # Adjust --gres=gpu:N and --ntasks-per-node=N together for different GPU counts.
+#
+# Test command (single GPU, sanity check only):
+#   python train_ultrassl.py --sanity-check --config config/ultrassl_vitb14_3d_labeled.yaml
+#
+# Test command (multi-GPU, no sbatch):
+#   torchrun --standalone --nproc_per_node=8 train_ultrassl.py \
+#       --config config/ultrassl_vitb14_3d_labeled.yaml
 # =============================================================================
 
 # Print job information

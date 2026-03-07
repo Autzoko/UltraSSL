@@ -29,7 +29,7 @@ sys.path.insert(0, str(project_root / "dinov2"))
 # Allow xFormers if available; set XFORMERS_DISABLED=1 in env to disable
 # os.environ.setdefault("XFORMERS_DISABLED", "1")
 
-from ultrassl.train.trainer import train, load_config, setup_distributed, setup_logging
+from ultrassl.train.trainer import train, load_config, setup_distributed, setup_logging, run_sanity_checks
 
 
 def main():
@@ -45,6 +45,10 @@ def main():
     parser.add_argument(
         "--no-resume", action="store_true",
         help="Start fresh training, ignore existing checkpoints",
+    )
+    parser.add_argument(
+        "--sanity-check", action="store_true",
+        help="Run sanity checks only (shard loading, augmentations, forward pass) then exit",
     )
     parser.add_argument(
         "opts", nargs=argparse.REMAINDER, default=[],
@@ -64,6 +68,11 @@ def main():
 
     # Setup logging
     setup_logging(cfg.train.output_dir, rank)
+
+    # Sanity check mode
+    if args.sanity_check:
+        ok = run_sanity_checks(cfg)
+        sys.exit(0 if ok else 1)
 
     # Optionally clear resume checkpoint
     if args.no_resume:

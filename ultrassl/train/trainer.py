@@ -230,6 +230,181 @@ def get_device(local_rank=0):
         return torch.device("cpu")
 
 
+def run_sanity_checks(cfg):
+    """Run pre-training sanity checks: shard loading, augmentation, forward pass.
+
+    Verifies the full pipeline works end-to-end before starting training.
+    Exits with status 0 on success.
+    """
+    device = get_device(0)
+    logger.info("=" * 60)
+    logger.info("SANITY CHECK: verifying pipeline before training")
+    logger.info("=" * 60)
+
+    # 1. Patch grid compatibility
+    global_size = cfg.crops.global_crops_size
+    local_size = cfg.crops.local_crops_size
+    patch_size = cfg.model.patch_size
+    assert global_size % patch_size == 0, (
+        f"global_crops_size={global_size} not divisible by patch_size={patch_size}")
+    assert local_size % patch_size == 0, (
+        f"local_crops_size={local_size} not divisible by patch_size={patch_size}")
+    global_tokens = (global_size // patch_size) ** 2
+    local_tokens = (local_size // patch_size) ** 2
+    logger.info(f"[OK] Patch grid: global {global_size}/{patch_size} = "
+                f"{global_size // patch_size}x{global_size // patch_size} = {global_tokens} tokens")
+    logger.info(f"[OK] Patch grid: local  {local_size}/{patch_size} = "
+                f"{local_size // patch_size}x{local_size // patch_size} = {local_tokens} tokens")
+
+    # 2. Check shard directory
+    data_cfg = cfg.get("data", {})
+    shard_dir = data_cfg.get("shard_dir", "")
+    if shard_dir:
+        if not os.path.isdir(shard_dir):
+            logger.error(f"[FAIL] shard_dir does not exist: {shard_dir}")
+            return False
+        # Check dataset subdirectories
+        import glob as globmod
+        subdirs = [d for d in sorted(os.listdir(shard_dir))
+                   if os.path.isdir(os.path.join(shard_dir, d))]
+        logger.info(f"[OK] shard_dir exists: {shard_dir}")
+        total_shards = 0
+        for sd in subdirs:
+            shards = globmod.glob(os.path.join(shard_dir, sd, "shard-*.tar"))
+            n = len(shards)
+            total_shards += n
+            logger.info(f"     {sd}: {n} shards")
+        if total_shards == 0:
+            logger.error("[FAIL] No shard-*.tar files found in any subdirectory")
+            return False
+        logger.info(f"[OK] Total shards: {total_shards}")
+
+    # 3. Load a few samples from the data pipeline
+    aug_cfg = cfg.get("augmentation", None)
+    data_transform = UltrasoundAugmentationDINO(
+        global_crops_scale=list(cfg.crops.global_crops_scale),
+        local_crops_scale=list(cfg.crops.local_crops_scale),
+        local_crops_number=cfg.crops.local_crops_number,
+        global_crops_size=global_size,
+        local_crops_size=local_size,
+        aug_cfg=aug_cfg,
+    )
+
+    use_webdataset = bool(shard_dir) and HAS_WEBDATASET
+    if use_webdataset:
+        data_mode = data_cfg.get("mode", "unlabeled")
+        if data_mode == "ssl":
+            from ultrassl.data.wds_labeled_dataset import build_labeled_wds_dataset
+            dataset, loader = build_labeled_wds_dataset(
+                shard_dir=shard_dir, mode="ssl", transform=data_transform,
+                epoch_length=10, batch_size=2, num_workers=0,
+                balance_datasets=data_cfg.get("balance_datasets", True),
+            )
+        else:
+            from ultrassl.data.wds_dataset import build_wds_dataset
+            dataset, loader = build_wds_dataset(
+                shard_dir=shard_dir, transform=data_transform,
+                epoch_length=10, batch_size=2, num_workers=0,
+            )
+
+        # Draw a few samples
+        n_check = 4
+        samples = []
+        for i, sample in enumerate(dataset):
+            if i >= n_check:
+                break
+            samples.append(sample)
+
+        if not samples:
+            logger.error("[FAIL] No samples could be loaded from shards")
+            return False
+
+        logger.info(f"[OK] Loaded {len(samples)} samples from WebDataset")
+
+        # Verify augmentation output shapes
+        img_dict, target = samples[0]
+        gc = img_dict["global_crops"]
+        lc = img_dict["local_crops"]
+        n_local = cfg.crops.local_crops_number
+        assert len(gc) == 2, f"Expected 2 global crops, got {len(gc)}"
+        assert len(lc) == n_local, f"Expected {n_local} local crops, got {len(lc)}"
+        assert gc[0].shape == (3, global_size, global_size), (
+            f"Global crop shape {gc[0].shape} != (3, {global_size}, {global_size})")
+        assert lc[0].shape == (3, local_size, local_size), (
+            f"Local crop shape {lc[0].shape} != (3, {local_size}, {local_size})")
+        logger.info(f"[OK] Augmentation output: 2 global {gc[0].shape}, "
+                    f"{n_local} local {lc[0].shape}")
+    else:
+        logger.info("[SKIP] No shard_dir set — raw file mode, skipping data check")
+
+    # 4. Forward pass through model
+    logger.info("Building model for forward pass check...")
+    model = UltraSSLMetaArch(cfg).to(device)
+
+    # Create a synthetic batch
+    n_tokens = (global_size // patch_size) ** 2
+    mask_generator = MaskingGenerator(
+        input_size=(global_size // patch_size, global_size // patch_size),
+        max_num_patches=int(0.5 * n_tokens),
+    )
+    collate_dtype = torch.half if device.type == "cuda" else torch.float32
+    collate_fn = partial(
+        collate_data_and_cast,
+        mask_ratio_tuple=list(cfg.ibot.mask_ratio_min_max),
+        mask_probability=cfg.ibot.mask_sample_probability,
+        n_tokens=n_tokens,
+        mask_generator=mask_generator,
+        dtype=collate_dtype,
+    )
+
+    # Build a small batch from real or synthetic data
+    if use_webdataset and samples:
+        batch_data = collate_fn(samples[:2])
+    else:
+        # Create synthetic samples
+        from PIL import Image as PILImage
+        import numpy as np
+        fake_samples = []
+        for _ in range(2):
+            fake_img = PILImage.fromarray(
+                np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8))
+            aug_out = data_transform(fake_img)
+            fake_samples.append((aug_out, ()))
+        batch_data = collate_fn(fake_samples)
+
+    model.train()
+    use_amp = device.type == "cuda"
+    try:
+        if use_amp:
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                loss, loss_dict = model.forward_backward(batch_data, teacher_temp=0.04)
+        else:
+            loss, loss_dict = model.forward_backward(batch_data, teacher_temp=0.04)
+
+        total_loss = loss.item()
+        if math.isnan(total_loss) or math.isinf(total_loss):
+            logger.error(f"[FAIL] Forward pass produced loss={total_loss}")
+            return False
+
+        losses_str = ", ".join(f"{k}={v.item():.4f}" if torch.is_tensor(v) else f"{k}={v:.4f}"
+                               for k, v in loss_dict.items())
+        logger.info(f"[OK] Forward pass: loss={total_loss:.4f} ({losses_str})")
+    except Exception as e:
+        logger.error(f"[FAIL] Forward pass error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    logger.info("=" * 60)
+    logger.info("ALL SANITY CHECKS PASSED")
+    logger.info("=" * 60)
+    return True
+
+
 def train(cfg):
     """Main training function."""
     rank, world_size, local_rank = setup_distributed()
@@ -318,6 +493,7 @@ def train(cfg):
         if data_mode == "ssl":
             # Labeled shards in SSL mode (ignore annotations, use all slices)
             logger.info("Using labeled shards in SSL mode (ignoring annotations)")
+            shuffle_buffer = data_cfg.get("shuffle_buffer", 5000)
             wds_dataset, wds_loader = build_labeled_wds_dataset(
                 shard_dir=shard_dir,
                 mode="ssl",
@@ -325,6 +501,7 @@ def train(cfg):
                 epoch_length=cfg.train.OFFICIAL_EPOCH_LENGTH,
                 batch_size=cfg.train.batch_size_per_gpu,
                 num_workers=cfg.train.num_workers,
+                shuffle_buffer=shuffle_buffer,
                 world_size=world_size,
                 rank=rank,
                 balance_datasets=data_cfg.get("balance_datasets", True),
