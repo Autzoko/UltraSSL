@@ -71,7 +71,7 @@ optim:
 train:
   batch_size_per_gpu: 24            # 8 GPUs × 24 = 192 effective batch
   num_workers: 8
-  output_dir: ./outputs/ultrassl_vitb14_3d_labeled
+  output_dir: checkpoint/DINO/all_3d
   OFFICIAL_EPOCH_LENGTH: 5000       # ~600K slices / (24*4 GPUs) ≈ 6250, round down
   seed: 42
   centering: "centering"

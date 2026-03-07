@@ -94,7 +94,7 @@ torchrun \
 if [ $? -eq 0 ]; then
     echo ""
     echo "Training completed successfully!"
-    echo "Checkpoints saved to: outputs/ultrassl_vitb14_3d_labeled/"
+    echo "Checkpoints saved to: checkpoint/DINO/all_3d/"
 else
     echo ""
     echo "Training failed with exit code $?"
