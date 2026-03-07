@@ -88,6 +88,7 @@ torchrun \
     --standalone \
     --nproc_per_node=${NGPUS} \
     train_ultrassl.py \
+    --no-resume \
     --config ${CONFIG} \
     data.shard_dir=${SHARD_DIR}
 
