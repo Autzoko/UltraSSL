@@ -4,10 +4,10 @@
 #SBATCH --error=logs/dino_%j.err
 #SBATCH --partition=nvidia
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=8
-#SBATCH --gres=gpu:8
+#SBATCH --ntasks-per-node=4
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=512G
+#SBATCH --mem=256G
 #SBATCH --time=72:00:00
 
 # =============================================================================
