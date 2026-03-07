@@ -72,9 +72,12 @@ def generate_gaussian_heatmap(
     for bbox in bboxes_normalized:
         nx1, ny1, nx2, ny2 = bbox
 
-        # Center in heatmap space
-        cx = (nx1 + nx2) / 2.0 * H
-        cy = (ny1 + ny2) / 2.0 * H
+        # Center in heatmap space — snap to integer grid so peak == 1.0 exactly.
+        # Required for CenterNet focal loss (pos_mask = target.eq(1)).
+        cx = int(round((nx1 + nx2) / 2.0 * H))
+        cy = int(round((ny1 + ny2) / 2.0 * H))
+        cx = max(0, min(H - 1, cx))
+        cy = max(0, min(H - 1, cy))
 
         # Bbox dims in heatmap space
         w_h = (nx2 - nx1) * H
