@@ -15,7 +15,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, RandomSampler
 from omegaconf import OmegaConf
 
@@ -63,12 +62,17 @@ def setup_logging(output_dir, rank=0):
 
 
 def setup_distributed():
-    """Initialize DDP if launched via torchrun."""
+    """Initialize distributed process group if launched via torchrun.
+
+    Uses gloo backend (no DDP wrapping — each GPU trains independently).
+    Safe to call multiple times (idempotent).
+    """
     if "RANK" in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        if not dist.is_initialized():
+            dist.init_process_group("gloo", rank=rank, world_size=world_size)
         torch.cuda.set_device(local_rank)
         return rank, world_size, local_rank
     return 0, 1, 0
@@ -209,10 +213,9 @@ def resume_from_checkpoint(model, optimizer, cfg):
     logger.info(f"Resuming from checkpoint: {latest_path}")
     ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
 
-    # Load model weights (handle DDP wrapper)
-    model_to_load = model.module if isinstance(model, DDP) else model
-    model_to_load.student.load_state_dict(ckpt["student"])
-    model_to_load.teacher.load_state_dict(ckpt["teacher"])
+    # Load model weights
+    model.student.load_state_dict(ckpt["student"])
+    model.teacher.load_state_dict(ckpt["teacher"])
     optimizer.load_state_dict(ckpt["optimizer"])
 
     start_iter = ckpt["iteration"] + 1
@@ -420,13 +423,11 @@ def train(cfg):
         torch.backends.cudnn.benchmark = True
 
     # ================================================================
-    # BUILD MODEL
+    # BUILD MODEL (no DDP — each GPU trains independently)
     # ================================================================
+    torch.manual_seed(cfg.train.get("seed", 42) + rank)
     model = UltraSSLMetaArch(cfg).to(device)
-
-    if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-    raw_model = model.module if isinstance(model, DDP) else model
+    raw_model = model
 
     # ================================================================
     # BUILD OPTIMIZER
@@ -652,13 +653,9 @@ def train(cfg):
         # EMA teacher update
         raw_model.update_teacher(mom)
 
-        # --- Logging ---
-        if world_size > 1:
-            for v in loss_dict.values():
-                if torch.is_tensor(v):
-                    dist.all_reduce(v)
+        # --- Logging (no all_reduce — each GPU logs its own loss) ---
         loss_dict_reduced = {
-            k: (v.item() / world_size if torch.is_tensor(v) else v)
+            k: (v.item() if torch.is_tensor(v) else v)
             for k, v in loss_dict.items()
         }
 
@@ -695,5 +692,5 @@ def train(cfg):
         save_checkpoint(raw_model, optimizer, iteration, cfg)
         logger.info("Training complete!")
 
-    if world_size > 1:
+    if dist.is_initialized():
         dist.destroy_process_group()
