@@ -240,11 +240,12 @@ class PatchFocalLoss(nn.Module):
 
                 if n_neg > n_neg_keep:
                     # Keep top-loss negatives (hard negative mining)
-                    neg_losses = per_element_loss[i] * neg_mask_i
-                    _, neg_order = neg_losses.sort(descending=True)
-                    # Zero out losses beyond the top n_neg_keep negatives
-                    neg_indices = neg_order[neg_mask_i[neg_order].cumsum(0) > n_neg_keep]
-                    subsample_mask[i, neg_indices] = False
+                    neg_idx = torch.where(neg_mask_i)[0]
+                    neg_losses_only = per_element_loss[i, neg_idx]
+                    _, topk_order = neg_losses_only.sort(descending=True)
+                    # Drop negatives beyond the top n_neg_keep
+                    drop_idx = neg_idx[topk_order[n_neg_keep:]]
+                    subsample_mask[i, drop_idx] = False
 
             per_element_loss = per_element_loss * subsample_mask
 
