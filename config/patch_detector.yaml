@@ -37,7 +37,7 @@ labeling:
 # --- Data ---
 data:
   shard_dir: "/scratch/ll5582/Data/Ultrasound/Shards"
-  split_dir: "./splits"           # output of prepare_patch_data.py
+  split_dir: "/scratch/ll5582/Data/Ultrasound/Shards_split"
   datasets: null                  # null = all datasets
   batch_size: 24
   num_workers: 8
