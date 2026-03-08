@@ -1,0 +1,77 @@
+# Patch-level lesion detector with three-region labeling
+#
+# Usage:
+#   # 1. Prepare data splits:
+#   python prepare_patch_data.py \
+#       --shard-dir /path/to/Shards --output-dir ./splits
+#
+#   # 2. Train (multi-GPU):
+#   torchrun --nproc_per_node=4 train_patch_detector.py \
+#       --config config/patch_detector.yaml
+#
+#   # 3. Evaluate:
+#   python eval_patch_detector.py \
+#       --config config/patch_detector.yaml \
+#       --checkpoint outputs/patch_detector/best_model.pth \
+#       --split test --visualize 20
+
+# --- Backbone (frozen DINO) ---
+backbone:
+  checkpoint: "checkpoint/DINO/all_3d/teacher_backbone_latest.pth"
+  arch: vit_base
+  patch_size: 14
+  img_size: 224
+
+# --- Detection head ---
+model:
+  head_hidden_dim: 256
+  unfreeze_last_n: 0             # set to 1-2 after warmup for fine-tuning
+
+# --- Three-region labeling ---
+labeling:
+  shrink_ratio: 0.7              # positive core = 70% of bbox
+  expand_ratio: 1.3              # ignore zone = 130% of bbox
+  positive_iou_thresh: 0.5       # overlap with shrunk box for positive
+  ignore_iou_thresh: 0.1         # overlap with expanded box for ignore
+
+# --- Data ---
+data:
+  shard_dir: "/scratch/ll5582/Data/Ultrasound/Shards"
+  split_dir: "./splits"           # output of prepare_patch_data.py
+  datasets: null                  # null = all datasets
+  batch_size: 24
+  num_workers: 8
+  shuffle_buffer: 5000
+  epoch_length: 1000
+  val_epoch_length: 200
+  oversample_positive: 3.0       # keep all pos, 1/3 negatives
+
+# --- Loss ---
+loss:
+  alpha: 0.25                    # focal loss alpha (positive weight)
+  gamma: 2.0                     # focal loss focusing parameter
+  neg_subsample_ratio: 3.0       # within-slice: keep 3x negatives per positive patch
+
+# --- Optimizer ---
+optim:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 50
+  warmup_epochs: 5
+  max_grad_norm: 1.0
+  finetune_lr_scale: 0.1         # LR multiplier when unfreezing backbone blocks
+
+# --- Training ---
+train:
+  output_dir: ./outputs/patch_detector
+  seed: 42
+  log_every: 20
+  use_amp: true
+  save_period: 5                 # save checkpoint every N epochs
+
+# --- Evaluation ---
+eval:
+  threshold: 0.5                 # patch score threshold for region extraction
+  min_area_patches: 2            # minimum connected component size
+  max_regions: 5                 # maximum regions per slice
+  region_iou_thresh: 0.3         # IoU threshold for region-level metrics
