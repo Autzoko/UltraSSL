@@ -17,7 +17,7 @@
 
 # --- Backbone (frozen DINO) ---
 backbone:
-  checkpoint: "checkpoint/DINO/all_3d/teacher_backbone_latest.pth"
+  checkpoint: "/scratch/ll5582/Projects/UltraSSL/checkpoint/DINO/all_3d/teacher_backbone_latest.pth"
   arch: vit_base
   patch_size: 14
   img_size: 224
