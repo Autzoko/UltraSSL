@@ -48,9 +48,10 @@ data:
 
 # --- Loss ---
 loss:
-  alpha: 0.25                    # focal loss alpha (positive weight)
+  alpha: 0.5                     # focal loss alpha (equal weight — sampling handles balance)
   gamma: 2.0                     # focal loss focusing parameter
-  neg_subsample_ratio: 3.0       # within-slice: keep 3x negatives per positive patch
+  neg_subsample_ratio: 1.0       # positive slices: keep 1:1 neg-to-pos ratio
+  neg_patches_per_neg_slice: 0   # negative slices: skip (no positives → no negatives)
 
 # --- Optimizer ---
 optim:

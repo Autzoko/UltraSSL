@@ -434,6 +434,7 @@ def main():
         alpha=cfg.loss.alpha,
         gamma=cfg.loss.gamma,
         neg_subsample_ratio=cfg.loss.neg_subsample_ratio,
+        neg_patches_per_neg_slice=cfg.loss.get("neg_patches_per_neg_slice", 10),
     )
 
     # Optimizer

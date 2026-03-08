@@ -169,18 +169,23 @@ class PatchFocalLoss(nn.Module):
     and within-slice hard negative mining.
 
     Args:
-        alpha: Weighting for positive class (default 0.25).
+        alpha: Weighting for positive class (default 0.75).
+            Higher alpha gives more weight to positives.
         gamma: Focusing parameter (default 2.0).
         neg_subsample_ratio: Max negatives per positive patch per slice (default 3.0).
             Set 0 to disable subsampling.
+        neg_patches_per_neg_slice: Max negative patches to keep per all-negative
+            slice (default 10). Prevents easy negatives from dominating.
     """
 
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0,
-                 neg_subsample_ratio: float = 3.0):
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0,
+                 neg_subsample_ratio: float = 3.0,
+                 neg_patches_per_neg_slice: int = 10):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.neg_subsample_ratio = neg_subsample_ratio
+        self.neg_patches_per_neg_slice = neg_patches_per_neg_slice
 
     def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
@@ -220,17 +225,26 @@ class PatchFocalLoss(nn.Module):
                 pos_mask_i = (labels[i] == 1.0)
                 neg_mask_i = (labels[i] == 0.0)
                 n_pos = pos_mask_i.sum().item()
+                n_neg = neg_mask_i.sum().item()
 
-                if n_pos > 0 and neg_mask_i.sum().item() > 0:
+                if n_neg == 0:
+                    continue
+
+                if n_pos > 0:
+                    # Positive slice: keep n_pos * ratio hard negatives
                     n_neg_keep = max(1, int(n_pos * self.neg_subsample_ratio))
-                    n_neg = neg_mask_i.sum().item()
-                    if n_neg > n_neg_keep:
-                        # Keep top-loss negatives (hard negative mining)
-                        neg_losses = per_element_loss[i] * neg_mask_i
-                        _, neg_order = neg_losses.sort(descending=True)
-                        # Zero out losses beyond the top n_neg_keep negatives
-                        neg_indices = neg_order[neg_mask_i[neg_order].cumsum(0) > n_neg_keep]
-                        subsample_mask[i, neg_indices] = False
+                else:
+                    # Negative slice: keep only a small fixed number of
+                    # hard negatives to prevent easy negatives dominating
+                    n_neg_keep = self.neg_patches_per_neg_slice
+
+                if n_neg > n_neg_keep:
+                    # Keep top-loss negatives (hard negative mining)
+                    neg_losses = per_element_loss[i] * neg_mask_i
+                    _, neg_order = neg_losses.sort(descending=True)
+                    # Zero out losses beyond the top n_neg_keep negatives
+                    neg_indices = neg_order[neg_mask_i[neg_order].cumsum(0) > n_neg_keep]
+                    subsample_mask[i, neg_indices] = False
 
             per_element_loss = per_element_loss * subsample_mask
 
